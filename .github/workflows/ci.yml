@@ -20,7 +20,7 @@ jobs:
           persist-credentials: false
 
       - name: Shellcheck
-        run: shellcheck infra/*.sh tools/ngf-deploy
+        run: shellcheck infra/*.sh tools/ngf-deploy tools/ngf-host
 
       - name: deploy.sh
         run: sh infra/deploy.test.sh
