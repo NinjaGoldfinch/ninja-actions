@@ -62,6 +62,7 @@ ok "host setup, run twice"
 
 ssh-keygen -q -t ed25519 -N '' -C ci-fakesvc -f "$t/key"
 ssh-keygen -q -t ed25519 -N '' -C ci-fakesvc-new -f "$t/key2"
+ssh-keygen -q -t ed25519 -N '' -C ci-badsvc -f "$t/key3"
 ssh-keyscan -t ed25519 127.0.0.1 2>/dev/null > "$t/known_hosts"
 remote() { # <key> <command...>
     k=$1; shift
@@ -84,7 +85,7 @@ ok "adopt moves a running service into /srv"
 # A failed adoption (here, new ExecStart arguments that make it exit) puts the
 # old setup back.
 if add badsvc --unit badsvc --health-url http://127.0.0.1:18081/healthz \
-    --key "$(cat "$t/key.pub")" --adopt /usr/local/bin/fakesvc v0.0.1 --exec-args broken >/dev/null 2>&1; then
+    --key "$(cat "$t/key3.pub")" --adopt /usr/local/bin/fakesvc v0.0.1 --exec-args broken >/dev/null 2>&1; then
     fail "an adoption whose service does not start succeeded"
 fi
 [ ! -e /etc/systemd/system/badsvc.service.d/ninja-deploy.conf ] || fail "drop-in left behind"
@@ -123,6 +124,14 @@ remote "$t/key" list | grep -qx 'v0.0.2 (live)' || fail "list"
 runuser -u deploy -- sudo -n systemctl restart ssh 2>/dev/null && fail "deploy may restart another unit"
 runuser -u deploy -- sudo -n systemctl status fakesvc.service >/dev/null || fail "deploy may not check its unit"
 ok "forced command and sudo rule hold"
+
+# A key already used for one service is refused for another.
+if add other --unit fakesvc --health-url http://127.0.0.1:18080/healthz \
+    --key "$(cat "$t/key.pub")" >/dev/null 2>&1; then
+    fail "one key accepted for two services"
+fi
+[ ! -e /etc/ninja-deploy/other.conf ] || fail "a refused key still left settings behind"
+ok "a key cannot serve two services"
 
 # Running add again rotates the key and keeps what is deployed.
 add fakesvc --unit fakesvc --health-url http://127.0.0.1:18080/healthz \

@@ -87,6 +87,15 @@ if [ -n "$adopt_bin" ] || [ -n "$adopt_version" ]; then
     case $exec_args in *"$nl"*) die "--exec-args must be one line" ;; esac
 fi
 
+# One key per service: sshd uses the first line that matches a key, so a key
+# listed for two services would only ever reach one of them.
+home=$(getent passwd "$user" | cut -d: -f6)
+keys=$home/.ssh/authorized_keys
+blob=$(printf '%s' "$key" | cut -d' ' -f2)
+other=$(grep -F " $blob" "$keys" 2>/dev/null | grep -vF "command=\"$deployer $service\"," \
+    | sed -n 's/^command="[^ ]* \([a-z0-9-]*\)".*/\1/p' | head -n 1)
+[ -z "$other" ] || die "that key is already used for $other; make a separate key for $service"
+
 root=/srv/$service
 install -d -m 0755 -o "$user" -g "$user" "$root" "$root/releases"
 install -d -m 0755 -o root -g root "$root/shared"
@@ -117,8 +126,6 @@ mv -f "$rule.tmp" "$rule"
 echo "wrote $rule"
 
 # The key, forced to this service. Any earlier key for it is replaced.
-home=$(getent passwd "$user" | cut -d: -f6)
-keys=$home/.ssh/authorized_keys
 line="command=\"$deployer $service\",restrict $key"
 {
     grep -vF "command=\"$deployer $service\"," "$keys" 2>/dev/null || true
