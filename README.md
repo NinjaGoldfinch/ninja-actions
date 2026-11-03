@@ -18,6 +18,7 @@ moving tag: after a change, move it (`git tag -f v1 && git push -f origin v1`).
 | `infra/deploy-host-add.sh` | Lets one repository deploy one service to that host: `/srv` layout, settings, a sudo rule for its unit only, the forced-command key. Can move a running service into `/srv`. |
 | `infra/deploy-host.test.sh` | End-to-end test of the three over real SSH, sudo and systemd; CI runs it on a throwaway hosted runner. |
 | `tools/ngf-deploy` | Starts `deploy.yml` from your own machine with `gh`: the latest release (or `-v`) of one service or `all`, to `prod` (or `-e staging`). `-l` lists the latest releases. |
+| `tools/ngf-host` | On a host: `ngf-host status` compares what runs with the latest release or commit; `ngf-host update` updates projects CI does not deploy yet (git checkouts, `gh:` release binaries). Config in `~/.config/ngf-host/projects.conf`. |
 | `infra/runner-setup.sh` | One-off setup of the self-hosted runner VM on Proxmox (run as root inside it). |
 | `infra/runner-add.sh` | Registers one repository's runner on that VM as a systemd service. |
 

@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# ngf-host — what's running on this box, and updates for projects CI doesn't deploy yet.
+#
+# Usage:
+#   ngf-host                          # same as: ngf-host status
+#   ngf-host status [project...]      # running vs latest, changes nothing
+#   ngf-host update [project...]      # update projects with new commits/releases
+#   ngf-host update --force [...]     # rebuild/restart even if nothing changed
+#   ngf-host update --dry-run [...]   # show what would happen
+#
+# Config: ~/.config/ngf-host/projects.conf, one line per project.
+#
+# Deployed by CI (status only; deploy with ngf-deploy from your machine):
+#   name|deploy:owner/repo|asset-name|service
+#   ninja-monitor|deploy:NinjaGoldfinch/ninja-monitor|ninja-monitor-x86_64-linux.tar.gz|ninja-monitor
+#
+# Git-checkout projects (pull, build in place, restart):
+#   name|path|branch|systemd-unit|build-command|user
+#   ninja-lol|/opt/ninjagoldfinch-lol|main|ninjagoldfinch-lol.service|pnpm install --frozen-lockfile && ORIGIN=https://ninjagoldfinch.lol pnpm build|ninjagoldfinch-lol
+# `user` (optional) owns the checkout: git and the build run as that user
+# through `sudo -H -u`, so files never end up owned by whoever ran this.
+#
+# Release-binary projects (download latest GitHub release asset, install, restart):
+#   name|gh:owner/repo|asset-name|systemd-unit|install-path
+#   riot-proxy|gh:NinjaGoldfinch/riot-proxy|riot-proxy-linux-amd64|riot-proxy.service|/usr/local/bin/riot-proxy
+#
+# Private repos: put a GitHub token (read-only, Contents scope) in
+# ~/.config/ngf-host/github-token (chmod 600). Needs curl + jq.
+# Installing to a root-owned path uses: sudo install -m 755 <tmp> <install-path>
+# so add a matching NOPASSWD sudoers line (see README/notes).
+
+set -euo pipefail
+
+CONF="${NGF_HOST_CONF:-$HOME/.config/ngf-host/projects.conf}"
+TOKEN_FILE="${NGF_HOST_TOKEN:-$HOME/.config/ngf-host/github-token}"
+LOG_DIR="${NGF_HOST_LOG:-$HOME/.local/state/ngf-host}"
+TMP_DIR="/tmp/ngf-host"
+LOCK="/tmp/ngf-host.lock"
+
+cmd=status
+case "${1:-}" in
+  status|update) cmd=$1; shift ;;
+  -h|--help|help) sed -n '2,30p' "$0"; exit 0 ;;
+esac
+force=0 dry=0; only=()
+for a in "$@"; do
+  case "$a" in
+    --force)   force=1 ;;
+    --dry-run) dry=1 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -*)        echo "unknown option $a (try --help)" >&2; exit 2 ;;
+    *)         only+=("$a") ;;
+  esac
+done
+if [[ $cmd == status ]] && (( force || dry )); then
+  echo "--force and --dry-run belong to: ngf-host update" >&2; exit 2
+fi
+
+[[ -f "$CONF" ]] || { echo "no config at $CONF" >&2; exit 1; }
+command -v jq >/dev/null || { echo "jq is required (sudo apt install -y jq)" >&2; exit 1; }
+mkdir -p "$LOG_DIR" "$TMP_DIR"
+
+ts()  { date '+%Y-%m-%d %H:%M:%S'; }
+say() { printf '%s [%s] %s\n' "$(ts)" "$1" "$2" | tee -a "$LOG_DIR/ngf-host.log"; }
+run() { if (( dry )); then echo "    would run: $*"; else "$@"; fi; }
+
+wanted() {
+  (( ${#only[@]} == 0 )) && return 0
+  local p; for p in "${only[@]}"; do [[ "$p" == "$1" ]] && return 0; done
+  return 1
+}
+
+gh_api() {
+  local url=$1; local -a hdr=(-H "Accept: application/vnd.github+json")
+  [[ -r "$TOKEN_FILE" ]] && hdr+=(-H "Authorization: Bearer $(<"$TOKEN_FILE")")
+  curl -fsSL "${hdr[@]}" "$url"
+}
+
+# --- status (read-only) ------------------------------------------------------
+show() { printf '%-16s %-12s %-12s %s\n' "$@"; }
+latest_tag() { gh_api "https://api.github.com/repos/$1/releases/latest" 2>/dev/null | jq -r '.tag_name // "?"' || echo '?'; }
+
+# CI-deployed services: compare what answers the health check, what was last
+# deployed (live.json) and the latest release.
+status_deploy() {
+  local name=$1 repo=${2#deploy:} service=${4:-$1} latest live running state
+  latest=$(latest_tag "$repo")
+  live=$(jq -r '.version // "?"' "/srv/$service/live.json" 2>/dev/null || echo none)
+  # shellcheck disable=SC1090 # the service's ninja-deploy settings, for HEALTH_URL
+  running=$( (. "/etc/ninja-deploy/$service.conf" && curl -fsS --max-time 2 "$HEALTH_URL") 2>/dev/null \
+             | jq -r '.version // empty' 2>/dev/null || true)
+  running=${running:+v${running#v}}
+  if [[ -z "$running" ]]; then state="NOT ANSWERING its health check"
+  elif [[ "$running" != "$live" ]]; then state="running $running, but the last deploy was $live"
+  elif [[ "$live" == "$latest" ]]; then state="up to date"
+  else state="behind: ngf-deploy $service"
+  fi
+  show "$name" "${running:-down}" "$latest" "$state"
+}
+
+status_release() {
+  local name=$1 repo=${2#gh:} latest installed
+  latest=$(latest_tag "$repo")
+  installed=$(cat "$LOG_DIR/$name.tag" 2>/dev/null || echo unknown)
+  if [[ "$installed" == "$latest" ]]; then
+    show "$name" "$installed" "$latest" "up to date"
+  else
+    show "$name" "$installed" "$latest" "behind: ngf-host update $name"
+  fi
+}
+
+status_git() {
+  local name=$1 path=$2 branch=$3 user=${6:-} here there behind
+  as_owner() { if [[ -n "$user" ]]; then sudo -H -u "$user" "$@"; else "$@"; fi; }
+  if ! as_owner git -C "$path" fetch --quiet origin "$branch" 2>/dev/null; then
+    show "$name" "?" "?" "FETCH FAILED${user:+ (as $user)}"; return
+  fi
+  here=$(as_owner git -C "$path" rev-parse --short HEAD)
+  there=$(as_owner git -C "$path" rev-parse --short "origin/$branch")
+  behind=$(as_owner git -C "$path" rev-list --count "HEAD..origin/$branch")
+  if [[ "$behind" == 0 ]]; then
+    show "$name" "$here" "$there" "up to date"
+  else
+    show "$name" "$here" "$there" "$behind commits behind: ngf-host update $name"
+  fi
+}
+
+# --- update: shared -----------------------------------------------------------
+# restart a unit and verify it came back; prints journal tail on failure
+restart_unit() {
+  local name=$1 unit=$2
+  [[ -z "$unit" ]] && return 0
+  say "$name" "restarting $unit"
+  run sudo systemctl restart "$unit"
+  (( dry )) || sleep 2
+  if (( dry )) || systemctl is-active --quiet "$unit"; then
+    say "$name" "ok"
+  else
+    say "$name" "FAILED — $unit is not active, last log lines:"
+    journalctl -u "$unit" -n 15 --no-pager | tee -a "$LOG_DIR/ngf-host.log"
+    return 1
+  fi
+}
+
+# --- update: git checkout projects ---------------------------------------------
+update_git() {
+  local name=$1 path=$2 branch=$3 unit=$4 build=$5 user=${6:-}
+  # As the checkout's owner, when the config names one.
+  as_owner() { if [[ -n "$user" ]]; then sudo -H -u "$user" "$@"; else "$@"; fi; }
+  if [[ ! -d "$path/.git" ]]; then
+    say "$name" "no git repo at $path"; return 1
+  fi
+  cd "$path"
+  # Each step checks its own result: set -e is off inside `( … ) || rc=$?`.
+  if ! as_owner git -C "$path" fetch --quiet origin "$branch"; then
+    say "$name" "FETCH FAILED${user:+ (as $user)}"; return 1
+  fi
+  local local_rev remote_rev
+  local_rev=$(as_owner git -C "$path" rev-parse HEAD) || { say "$name" "git rev-parse failed"; return 1; }
+  remote_rev=$(as_owner git -C "$path" rev-parse "origin/$branch") || { say "$name" "git rev-parse failed"; return 1; }
+
+  if [[ "$local_rev" == "$remote_rev" && $force -eq 0 ]]; then
+    say "$name" "up to date (${local_rev:0:7})"; return 3
+  fi
+
+  say "$name" "updating ${local_rev:0:7} -> ${remote_rev:0:7}"
+  if ! run as_owner git -C "$path" checkout --quiet "$branch" ||
+     ! run as_owner git -C "$path" pull --ff-only --quiet origin "$branch"; then
+    say "$name" "PULL FAILED"; return 1
+  fi
+
+  if [[ -n "$build" ]]; then
+    say "$name" "building: $build"
+    if (( dry )); then echo "    would run: $build"
+    elif ! as_owner bash -c "cd \"\$1\" && $build" _ "$path" >>"$LOG_DIR/$name.log" 2>&1; then
+      say "$name" "BUILD FAILED — last lines of $LOG_DIR/$name.log:"
+      tail -n 20 "$LOG_DIR/$name.log" | tee -a "$LOG_DIR/ngf-host.log"
+      return 1
+    fi
+  fi
+  restart_unit "$name" "$unit"
+}
+
+# --- update: GitHub release projects -------------------------------------------
+update_release() {
+  local name=$1 repo=${2#gh:} asset=$3 unit=$4 dest=$5
+
+  local json tag url installed_file installed
+  if ! json=$(gh_api "https://api.github.com/repos/$repo/releases/latest"); then
+    say "$name" "could not fetch latest release for $repo (private repo without token? no releases yet?)"; return 1
+  fi
+  tag=$(jq -r .tag_name <<<"$json")
+  url=$(jq -r --arg a "$asset" '.assets[] | select(.name==$a) | .url' <<<"$json")
+  if [[ -z "$url" || "$url" == null ]]; then
+    say "$name" "release $tag has no asset named '$asset'. Assets: $(jq -r '[.assets[].name]|join(", ")' <<<"$json")"
+    return 1
+  fi
+
+  installed_file="$LOG_DIR/$name.tag"
+  installed=$(cat "$installed_file" 2>/dev/null || echo none)
+  if [[ "$installed" == "$tag" && $force -eq 0 ]]; then
+    say "$name" "up to date ($tag)"; return 3
+  fi
+
+  say "$name" "updating $installed -> $tag"
+  local tmp="$TMP_DIR/$name"
+  if (( dry )); then
+    echo "    would download $asset from $tag to $tmp"
+    echo "    would run: sudo install -m 755 $tmp $dest"
+  else
+    local -a hdr=(-H "Accept: application/octet-stream")
+    [[ -r "$TOKEN_FILE" ]] && hdr+=(-H "Authorization: Bearer $(<"$TOKEN_FILE")")
+    local dl="$TMP_DIR/$name.download"
+    if ! curl -fsSL "${hdr[@]}" -o "$dl" "$url"; then
+      say "$name" "download failed"; return 1
+    fi
+
+    # verify against SHA256SUMS if the release ships one
+    local sums_url
+    sums_url=$(jq -r '.assets[] | select(.name=="SHA256SUMS") | .url' <<<"$json")
+    if [[ -n "$sums_url" && "$sums_url" != null ]]; then
+      local expected actual
+      expected=$(curl -fsSL "${hdr[@]}" "$sums_url" | awk -v a="$asset" '$2==a || $2=="*"a {print $1}')
+      actual=$(sha256sum "$dl" | awk '{print $1}')
+      if [[ -z "$expected" ]]; then
+        say "$name" "warning: $asset not listed in SHA256SUMS, skipping verification"
+      elif [[ "$expected" != "$actual" ]]; then
+        say "$name" "CHECKSUM MISMATCH for $asset — not installing"; rm -f "$dl"; return 1
+      else
+        say "$name" "checksum ok"
+      fi
+    fi
+
+    # archives: extract and find the binary inside
+    case "$asset" in
+      *.tar.gz|*.tgz)
+        local ex="$TMP_DIR/$name.extract"; rm -rf "$ex"; mkdir -p "$ex"
+        tar -xzf "$dl" -C "$ex"
+        local bin
+        bin=$(find "$ex" -type f \( -name "$name" -o -perm -u+x \) | grep -v '\.\(md\|txt\|toml\|yaml\|yml\|json\|service\)$' | head -n 1)
+        if [[ -z "$bin" ]]; then
+          say "$name" "no binary found inside $asset. Contents: $(find "$ex" -type f -printf '%P ' )"; return 1
+        fi
+        mv "$bin" "$tmp"; rm -rf "$ex" "$dl" ;;
+      *)
+        mv "$dl" "$tmp" ;;
+    esac
+    chmod 755 "$tmp"
+    # sanity check: it must at least run --version/--help without crashing
+    if ! "$tmp" --version >/dev/null 2>&1 && ! "$tmp" --help >/dev/null 2>&1; then
+      say "$name" "downloaded binary won't execute (wrong arch? not a binary?)"; return 1
+    fi
+    sudo install -m 755 "$tmp" "$dest"
+    rm -f "$tmp"
+  fi
+
+  restart_unit "$name" "$unit" || return 1
+  (( dry )) || echo "$tag" >"$installed_file"
+}
+
+# --- main ----------------------------------------------------------------------
+if [[ $cmd == status ]]; then
+  show PROJECT RUNNING LATEST STATE
+  while IFS='|' read -r name f2 f3 f4 f5 f6; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    wanted "$name" || continue
+    case "$f2" in
+      deploy:*) status_deploy  "$name" "$f2" "$f3" "$f4" ;;
+      gh:*)     status_release "$name" "$f2" ;;
+      *)        status_git     "$name" "$f2" "$f3" "$f4" "$f5" "$f6" ;;
+    esac
+  done < "$CONF"
+  exit 0
+fi
+
+# don't let two updates overlap (e.g. timer + manual)
+exec 9>"$LOCK"
+flock -n 9 || { echo "another ngf-host update is running" >&2; exit 1; }
+
+updated=() skipped=() failed=()
+while IFS='|' read -r name f2 f3 f4 f5 f6; do
+  [[ -z "$name" || "$name" == \#* ]] && continue
+  wanted "$name" || continue
+
+  if [[ "$f2" == deploy:* ]]; then
+    say "$name" "deployed by CI, not here (ngf-deploy $name from your machine)"
+    skipped+=("$name"); continue
+  fi
+  rc=0
+  if [[ "$f2" == gh:* ]]; then
+    ( update_release "$name" "$f2" "$f3" "$f4" "$f5" ) || rc=$?
+  else
+    ( update_git "$name" "$f2" "$f3" "$f4" "$f5" "$f6" ) || rc=$?
+  fi
+  case $rc in
+    0) updated+=("$name") ;;
+    3) skipped+=("$name") ;;
+    *) failed+=("$name") ;;
+  esac
+done < "$CONF"
+
+echo
+echo "updated: ${updated[*]:-none}"
+echo "skipped: ${skipped[*]:-none}"
+(( ${#failed[@]} )) && { echo "FAILED:  ${failed[*]}"; exit 1; }
+exit 0
