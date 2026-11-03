@@ -72,15 +72,18 @@ remote() { # <key> <command...>
 add() { sh "$here/deploy-host-add.sh" "$@"; }
 
 # Adopt the running service into /srv.
+cp /usr/local/bin/fakesvc /usr/local/bin/fakesvc-orig
 add fakesvc --unit fakesvc --health-url http://127.0.0.1:18080/healthz \
     --key "$(cat "$t/key.pub")" --keep 2 \
-    --adopt /usr/local/bin/fakesvc v0.0.1 --exec-args '' >/dev/null
+    --adopt /usr/local/bin/fakesvc v0.0.1 --exec-args '' --link >/dev/null
 [ "$(readlink /srv/fakesvc/current)" = /srv/fakesvc/releases/v0.0.1 ] || fail "current after adopt"
 systemctl show -p ExecStart --value fakesvc | grep -q 'path=/srv/fakesvc/current/fakesvc' \
     || fail "unit not pointed at current: $(systemctl show -p ExecStart --value fakesvc)"
 [ "$(version_on 18080)" = 0.0.1 ] || fail "service unhealthy after adopt"
 grep -q '"version":"v0.0.1"' /srv/fakesvc/live.json || fail "live.json after adopt"
-ok "adopt moves a running service into /srv"
+[ "$(readlink /usr/local/bin/fakesvc)" = /srv/fakesvc/current/fakesvc ] || fail "--link: no symlink to current"
+cmp -s /usr/local/bin/fakesvc.pre-deploy /usr/local/bin/fakesvc-orig || fail "--link: original not kept"
+ok "adopt moves a running service into /srv; --link points the old path at current"
 
 # A failed adoption (here, new ExecStart arguments that make it exit) puts the
 # old setup back.
@@ -140,6 +143,7 @@ add fakesvc --unit fakesvc --health-url http://127.0.0.1:18080/healthz \
 remote "$t/key" list >/dev/null 2>&1 && fail "the old key still works"
 remote "$t/key2" list | grep -qx 'v0.0.2 (live)' || fail "new key, or the live release changed"
 ok "re-running add rotates the key and keeps the live release"
+[ "$(readlink /usr/local/bin/fakesvc)" = /srv/fakesvc/current/fakesvc ] || fail "--link changed by a later run"
 
 # --health-wait reaches ninja-deploy's settings; nonsense is refused before anything changes.
 add fakesvc --unit fakesvc --health-url http://127.0.0.1:18080/healthz \

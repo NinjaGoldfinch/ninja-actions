@@ -92,6 +92,11 @@ that fails, the drop-in is removed and the old setup restarted, so nothing is
 left half moved. Deleting the drop-in later (then `systemctl daemon-reload`
 and a restart) goes back to the unit's own `ExecStart` just as well.
 
+Add `--link` when other tools call the installed path (an admin helper, a
+runbook): the installed binary is moved to `<path>.pre-deploy` and replaced
+by a symlink to `/srv/<service>/current/<binary>`, so they run whatever
+release is live instead of the one installed before adoption.
+
 ninja-monitor on the VPS, for example:
 
 ```sh

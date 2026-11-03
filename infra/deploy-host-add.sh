@@ -5,7 +5,7 @@
 #
 #   sudo ./infra/deploy-host-add.sh <service> --unit <unit> --health-url <url> \
 #       --key '<ssh public key>' [--shared '<items>'] [--keep <n>] [--health-wait <s>] \
-#       [--adopt <installed binary> <its version> --exec-args '<arguments>']
+#       [--adopt <installed binary> <its version> --exec-args '<arguments>' [--link]]
 #
 #   --unit        systemd unit to restart, e.g. ninja-monitor.service
 #   --health-url  loopback URL answering 2xx, with "version" in its JSON if it can
@@ -21,6 +21,10 @@
 #                 health-check it. If it is not healthy the drop-in is removed
 #                 and the old setup restarted. --exec-args gives the arguments
 #                 for the new ExecStart (the unit's current ones, usually).
+#   --link        with --adopt: replace the installed binary by a symlink to
+#                 /srv/<service>/current/<binary> (the original is kept as
+#                 <path>.pre-deploy), so helpers and runbooks that call the old
+#                 path run the live release. Safe to add on a later run.
 set -eu
 
 user=deploy
@@ -31,11 +35,11 @@ die() { echo "deploy-host-add.sh: $*" >&2; exit 1; }
 
 service=${1:-}
 case $service in
-    -h | --help) sed -n '2,23s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,27s/^# \{0,1\}//p' "$0"; exit 0 ;;
     '' | -* | *[!a-z0-9-]*) die "first argument: a service name (a-z, 0-9, -); try --help" ;;
 esac
 shift
-unit='' health_url='' key='' shared='' keep=5 health_wait=30 adopt_bin='' adopt_version='' exec_args='' have_exec_args=no
+unit='' health_url='' key='' shared='' keep=5 health_wait=30 adopt_bin='' adopt_version='' exec_args='' have_exec_args=no link=no
 while [ $# -gt 0 ]; do
     case $1 in
         --unit) shift; unit=${1:-} ;;
@@ -46,6 +50,7 @@ while [ $# -gt 0 ]; do
         --health-wait) shift; health_wait=${1:-} ;;
         --adopt) shift; adopt_bin=${1:-}; shift; adopt_version=${1:-} ;;
         --exec-args) shift; exec_args=${1-}; have_exec_args=yes ;;
+        --link) link=yes ;;
         *) die "unknown argument $1 (try --help)" ;;
     esac
     [ $# -gt 0 ] && shift
@@ -80,6 +85,9 @@ case $shared in *[!A-Za-z0-9._\ -]*) die "--shared takes space-separated file na
 printf '%s' "$key" | grep -Eqx '(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com) [A-Za-z0-9+/]+=* ?[A-Za-z0-9@._+-]*' \
     || die "--key must be one public key line, e.g. 'ssh-ed25519 AAAA... ci-$service'"
 
+if [ "$link" = yes ] && [ -z "$adopt_bin" ]; then
+    die "--link goes with --adopt (it replaces the adopted binary)"
+fi
 if [ -n "$adopt_bin" ] || [ -n "$adopt_version" ]; then
     if [ ! -f "$adopt_bin" ] || [ ! -x "$adopt_bin" ]; then
         die "--adopt: $adopt_bin is not an executable file"
@@ -209,6 +217,18 @@ if [ -n "$adopt_bin" ]; then
             systemctl restart "$unit" || true
             die "adoption failed; $unit is back on its own ExecStart"
         fi
+    fi
+fi
+
+if [ "$link" = yes ] && [ -e "$root/current" ]; then
+    target=$root/current/$(basename "$adopt_bin")
+    if [ "$(readlink "$adopt_bin" 2>/dev/null)" = "$target" ]; then
+        echo "$adopt_bin already points at $target"
+    else
+        [ -e "$adopt_bin.pre-deploy" ] && die "$adopt_bin.pre-deploy exists; move it away first"
+        mv "$adopt_bin" "$adopt_bin.pre-deploy"
+        ln -s "$target" "$adopt_bin"
+        echo "$adopt_bin -> $target (the original is $adopt_bin.pre-deploy)"
     fi
 fi
 
