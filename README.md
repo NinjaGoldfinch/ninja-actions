@@ -35,3 +35,7 @@ repository's service, and only through the commands above. Releases live in
 `/srv/<service>/releases/<version>/`, `current` points at the live one, and
 `/srv/<service>/shared/` holds what outlives a release. Rollback is deploying
 an older version that is still on disk; the last five are kept.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
