@@ -1,0 +1,78 @@
+#!/bin/sh
+# ngf-tunnel: run the *-tunnels entries of ~/.ssh/config in the background.
+#
+#   ngf-tunnel up [name...]     start them (all *-tunnels entries if none named)
+#   ngf-tunnel down [name...]   stop them
+#   ngf-tunnel status           which are up, and their forwards
+#
+# A name can be the full entry (ngf-prod-tunnels) or short (prod, for
+# ngf-prod-tunnels). Each tunnel is one ssh process with a control socket in
+# ~/.ssh/ngf-tunnels/, so status and down find it again.
+set -eu
+
+conf=$HOME/.ssh/config
+sockets=$HOME/.ssh/ngf-tunnels
+
+usage() { sed -n '2,10s/^# \{0,1\}//p' "$0"; }
+
+all() { awk 'tolower($1) == "host" { for (i = 2; i <= NF; i++) if ($i ~ /-tunnels$/) print $i }' "$conf"; }
+
+resolve() { # <name>: the matching *-tunnels entry, or nothing
+    for h in $(all); do
+        case $h in "$1" | "ngf-$1-tunnels" | "$1-tunnels") echo "$h"; return ;; esac
+    done
+}
+
+names() { # the entries named on the command line, or all of them
+    if [ $# -eq 0 ]; then all; return; fi
+    for n in "$@"; do
+        h=$(resolve "$n")
+        [ -n "$h" ] || { echo "ngf-tunnel: no *-tunnels entry for '$n' in $conf" >&2; exit 1; }
+        echo "$h"
+    done
+}
+
+is_up() { ssh -S "$sockets/$1" -O check "$1" >/dev/null 2>&1; }
+
+forwards() { ssh -G "$1" | awk '$1 == "localforward" { gsub(/[][]/, "", $3); printf "%s%s -> %s", sep, $2, $3; sep = ", " }'; }
+
+cmd=${1:-status}
+[ $# -gt 0 ] && shift
+mkdir -p "$sockets" && chmod 700 "$sockets"
+
+case $cmd in up | down) list=$(names "$@") || exit 1 ;; esac
+failed=0
+
+case $cmd in
+up)
+    for h in $list; do
+        if is_up "$h"; then echo "$h: already up ($(forwards "$h"))"; continue; fi
+        # -f goes to the background only once the forwards are listening
+        # (ExitOnForwardFailure), so a busy local port fails here, visibly.
+        if ssh -f -N -M -S "$sockets/$h" -o ControlPersist=no "$h"; then
+            echo "$h: up ($(forwards "$h"))"
+        else
+            echo "$h: FAILED to start (is a local port already in use? lsof -i :<port>)" >&2
+            failed=1
+        fi
+    done
+    ;;
+down)
+    for h in $list; do
+        if is_up "$h"; then
+            ssh -S "$sockets/$h" -O exit "$h" 2>/dev/null
+            echo "$h: down"
+        else
+            echo "$h: was not up"
+        fi
+    done
+    ;;
+status)
+    for h in $(all); do
+        if is_up "$h"; then echo "$h: up ($(forwards "$h"))"; else echo "$h: down"; fi
+    done
+    ;;
+-h | --help | help) usage ;;
+*) usage; exit 2 ;;
+esac
+exit "$failed"
