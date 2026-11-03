@@ -24,3 +24,20 @@ jobs:
 
       - name: deploy.sh
         run: sh infra/deploy.test.sh
+
+  deploy-host:
+    name: Deploy host (end to end)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: sshd
+        run: |
+          sudo apt-get install -y -qq openssh-server >/dev/null
+          sudo systemctl start ssh
+
+      - name: Setup, adopt, deploy over SSH, roll back, rotate the key
+        run: sudo CI=true sh infra/deploy-host.test.sh
