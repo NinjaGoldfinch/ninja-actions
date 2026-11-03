@@ -93,3 +93,7 @@ longer the one that runs.
 A deploy key lets its repository run any release of that service with the
 service's own permissions and secrets, which is why the `prod` environment
 needs an approval.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
