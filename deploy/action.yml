@@ -1,0 +1,102 @@
+name: Deploy
+description: >
+  Deploy one release of a service to a host running infra/deploy.sh
+  (ninja-deploy): download the release asset and check it against the
+  release's checksums, upload it unless the host already has that version,
+  then activate it. Activation health-checks the service and rolls back on
+  failure, which fails this step. Rolling back on purpose is deploying an
+  older version that is still on disk: it skips the upload.
+
+inputs:
+  service:
+    description: Service name, as configured on the host (/etc/ninja-deploy/<service>.conf).
+    required: true
+  version:
+    description: Release tag, e.g. v1.2.3.
+    required: true
+  asset:
+    description: Release asset to deploy, a .tar.gz with one top-level directory holding version.json.
+    required: true
+  checksums:
+    description: Release asset listing sha256 sums.
+    default: SHA256SUMS
+  host:
+    description: Deploy host address.
+    required: true
+  user:
+    description: Deploy user on the host.
+    default: deploy
+  known-hosts:
+    description: known_hosts line(s) for the host.
+    required: true
+  ssh-key:
+    description: Private key whose public half is forced to `ninja-deploy <service>` on the host.
+    required: true
+  token:
+    description: Token for downloading the release.
+    default: ${{ github.token }}
+
+outputs:
+  result:
+    description: success or failure
+    value: ${{ steps.deploy.outputs.result }}
+
+runs:
+  using: composite
+  steps:
+    - id: deploy
+      shell: bash
+      env:
+        SERVICE: ${{ inputs.service }}
+        VERSION: ${{ inputs.version }}
+        ASSET: ${{ inputs.asset }}
+        CHECKSUMS: ${{ inputs.checksums }}
+        HOST: ${{ inputs.host }}
+        DEPLOY_USER: ${{ inputs.user }}
+        KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        SSH_KEY: ${{ inputs.ssh-key }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -uo pipefail
+        key=$RUNNER_TEMP/deploy-key kh=$RUNNER_TEMP/deploy-known-hosts log=$RUNNER_TEMP/deploy.log
+        (umask 077; printf '%s\n' "$SSH_KEY" > "$key"; printf '%s\n' "$KNOWN_HOSTS" > "$kh")
+        trap 'rm -f "$key" "$kh"' EXIT
+        remote() {
+          ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
+            -o UserKnownHostsFile="$kh" -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$HOST" "$@"
+        }
+        started=$(date +%s)
+
+        deploy() {
+          remote has "$VERSION"
+          case $? in
+          0) echo "$VERSION is already on $HOST, skipping the upload" ;;
+          1)
+            dl=$RUNNER_TEMP/release
+            rm -rf "$dl" && mkdir "$dl"
+            gh release download "$VERSION" -R "$GITHUB_REPOSITORY" -p "$ASSET" -p "$CHECKSUMS" -D "$dl" || return 1
+            (cd "$dl" && sha256sum --ignore-missing --strict -c "$CHECKSUMS") || return 1
+            remote upload "$VERSION" < "$dl/$ASSET" || return 1
+            ;;
+          *) echo "::error::cannot reach $DEPLOY_USER@$HOST"; return 1 ;;
+          esac
+          remote activate "$VERSION"
+        }
+
+        deploy 2>&1 | tee "$log"
+        status=${PIPESTATUS[0]}
+        result=$([ "$status" = 0 ] && echo success || echo failure)
+        echo "result=$result" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "## Deploy $SERVICE $VERSION: $result"
+          echo
+          echo "Host \`$HOST\`, $(( $(date +%s) - started )) s."
+          echo
+          echo '```'
+          tail -n 50 "$log"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        [ "$status" = 0 ] || echo "::error::deploy of $SERVICE $VERSION failed; see the log above"
+        exit "$status"
