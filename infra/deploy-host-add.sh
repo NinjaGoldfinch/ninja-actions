@@ -49,8 +49,9 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
-[ -x "$deployer" ] && [ -r "$etc/env" ] && id "$user" >/dev/null 2>&1 \
-    || die "run deploy-host-setup.sh first"
+if [ ! -x "$deployer" ] || [ ! -r "$etc/env" ] || ! id "$user" >/dev/null 2>&1; then
+    die "run deploy-host-setup.sh first"
+fi
 
 case $unit in
     '') die "--unit is required" ;;
@@ -75,7 +76,9 @@ printf '%s' "$key" | grep -Eqx '(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|52
     || die "--key must be one public key line, e.g. 'ssh-ed25519 AAAA... ci-$service'"
 
 if [ -n "$adopt_bin" ] || [ -n "$adopt_version" ]; then
-    [ -x "$adopt_bin" ] && [ -f "$adopt_bin" ] || die "--adopt: $adopt_bin is not an executable file"
+    if [ ! -f "$adopt_bin" ] || [ ! -x "$adopt_bin" ]; then
+        die "--adopt: $adopt_bin is not an executable file"
+    fi
     printf '%s' "$adopt_version" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' \
         || die "--adopt: version '$adopt_version' should look like v1.2.3"
     [ "$have_exec_args" = yes ] || die "--adopt needs --exec-args (use '' for none)"

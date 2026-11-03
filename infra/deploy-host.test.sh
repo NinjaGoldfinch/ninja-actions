@@ -6,11 +6,14 @@
 #
 # A fake service stands in for a real one: a shell script serving
 # {"version": ...} from the version.json next to it (0.0.1 when there is none,
-# 0.0.0 when the release holds a file named `broken`).
+# 0.0.0 when the release holds a file named `broken`). Started with the
+# argument `broken`, it exits at once.
 set -eu
 
-[ "$(id -u)" -eq 0 ] && [ "${CI:-}" = true ] \
-    || { echo "deploy-host.test.sh: only as root on a throwaway CI machine (CI=true)" >&2; exit 1; }
+if [ "$(id -u)" -ne 0 ] || [ "${CI:-}" != true ]; then
+    echo "deploy-host.test.sh: only as root on a throwaway CI machine (CI=true)" >&2
+    exit 1
+fi
 
 here=$(cd "$(dirname "$0")" && pwd)
 t=$(mktemp -d)
@@ -19,6 +22,7 @@ ok() { echo "ok: $*"; }
 
 cat > /usr/local/bin/fakesvc <<'EOF'
 #!/bin/sh
+[ "${1:-}" = broken ] && exit 1
 d=$(dirname "$(readlink -f "$0")")
 v=$(sed -n 's/.*"version" *: *"v\{0,1\}\([^"]*\)".*/\1/p' "$d/version.json" 2>/dev/null || true)
 [ -n "$v" ] || v=0.0.1
@@ -77,13 +81,14 @@ systemctl show -p ExecStart --value fakesvc | grep -q 'path=/srv/fakesvc/current
 grep -q '"version":"v0.0.1"' /srv/fakesvc/live.json || fail "live.json after adopt"
 ok "adopt moves a running service into /srv"
 
-# A failed adoption puts the old setup back.
+# A failed adoption (here, new ExecStart arguments that make it exit) puts the
+# old setup back.
 if add badsvc --unit badsvc --health-url http://127.0.0.1:18081/healthz \
-    --key "$(cat "$t/key.pub")" --adopt /usr/local/bin/fakesvc v9.9.9 --exec-args '' >/dev/null 2>&1; then
-    fail "adopting with the wrong version succeeded"
+    --key "$(cat "$t/key.pub")" --adopt /usr/local/bin/fakesvc v0.0.1 --exec-args broken >/dev/null 2>&1; then
+    fail "an adoption whose service does not start succeeded"
 fi
 [ ! -e /etc/systemd/system/badsvc.service.d/ninja-deploy.conf ] || fail "drop-in left behind"
-[ ! -e /srv/badsvc/current ] && [ ! -e /srv/badsvc/releases/v9.9.9 ] || fail "adoption leftovers"
+if [ -e /srv/badsvc/current ] || [ -e /srv/badsvc/releases/v0.0.1 ]; then fail "adoption leftovers"; fi
 [ "$(version_on 18081)" = 0.0.1 ] || fail "service not restored after a failed adopt"
 ok "failed adoption restores the old setup"
 
