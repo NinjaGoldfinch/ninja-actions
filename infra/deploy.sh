@@ -46,7 +46,9 @@ ENV='' UNIT='' HEALTH_URL='' SHARED='' KEEP=5 HEALTH_WAIT=30
 . "$etc/env"
 # shellcheck disable=SC1090
 . "$etc/$service.conf"
-[ -n "$ENV" ] && [ -n "$UNIT" ] && [ -n "$HEALTH_URL" ] || die "incomplete settings for $service"
+if [ -z "$ENV" ] || [ -z "$UNIT" ] || [ -z "$HEALTH_URL" ]; then
+    die "incomplete settings for $service"
+fi
 
 root=$srv/$service
 releases=$root/releases
