@@ -17,6 +17,7 @@ moving tag: after a change, move it (`git tag -f v1 && git push -f origin v1`).
 | `infra/deploy-host-setup.sh` | One-off setup of a deploy host: installs `ninja-deploy`, creates the `deploy` user, writes `/etc/ninja-deploy/env`. |
 | `infra/deploy-host-add.sh` | Lets one repository deploy one service to that host: `/srv` layout, settings, a sudo rule for its unit only, the forced-command key. Can move a running service into `/srv`. |
 | `infra/deploy-host.test.sh` | End-to-end test of the three over real SSH, sudo and systemd; CI runs it on a throwaway hosted runner. |
+| `tools/ngf-deploy` | Starts `deploy.yml` from your own machine with `gh`: the latest release (or `-v`) of one service or `all`, to `prod` (or `-e staging`). `-l` lists the latest releases. |
 | `infra/runner-setup.sh` | One-off setup of the self-hosted runner VM on Proxmox (run as root inside it). |
 | `infra/runner-add.sh` | Registers one repository's runner on that VM as a systemd service. |
 
@@ -38,6 +39,18 @@ repository's service, and only through the commands above. Releases live in
 `/srv/<service>/releases/<version>/`, `current` points at the live one, and
 `/srv/<service>/shared/` holds what outlives a release. Rollback is deploying
 an older version that is still on disk; the last five are kept.
+
+### Deploying
+
+From your own machine (needs `gh`, logged in):
+
+```sh
+curl -fsSL -o ~/bin/ngf-deploy https://raw.githubusercontent.com/NinjaGoldfinch/ninja-actions/main/tools/ngf-deploy
+chmod +x ~/bin/ngf-deploy
+ngf-deploy ninja-monitor            # latest release to prod; approve it in the run
+ngf-deploy ninja-monitor -v v0.2.1  # a specific version, e.g. to roll back
+ngf-deploy -l                       # latest release of each repository
+```
 
 ### Setting up a host
 

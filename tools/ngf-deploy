@@ -1,0 +1,89 @@
+#!/bin/sh
+# ngf-deploy: start a deploy from your own machine. It runs the repository's
+# deploy.yml through the GitHub CLI, so prod still waits for your approval and
+# every deploy is in the Actions history.
+#
+#   ngf-deploy <service>... [-v <version>] [-e prod|staging] [-w]
+#   ngf-deploy all [-e prod|staging]
+#   ngf-deploy -l
+#
+#   <service>  a repository name: ninja-monitor, riot-proxy, ninjagoldfinch-lol
+#   all        every repository that has a deploy.yml
+#   -v         release tag to deploy (default: the latest release)
+#   -e         environment (default: prod)
+#   -w         wait for the run and show how it ended (approve it meanwhile)
+#   -l         list each repository's latest release and whether it can deploy
+#
+# Needs gh, logged in (gh auth login). Rolling back is deploying an older -v.
+set -eu
+
+owner=NinjaGoldfinch
+repos="ninja-monitor riot-proxy ninjagoldfinch-lol"
+
+usage() { sed -n '2,19s/^# \{0,1\}//p' "$0"; }
+die() { echo "ngf-deploy: $*" >&2; exit 1; }
+
+env=prod version='' watch=no list=no services='' all=no
+while [ $# -gt 0 ]; do
+    case $1 in
+        -v) shift; version=${1:-} ;;
+        -e) shift; env=${1:-} ;;
+        -w) watch=yes ;;
+        -l) list=yes ;;
+        -h | --help) usage; exit 0 ;;
+        -*) die "unknown option $1 (try -h)" ;;
+        all) services=$repos all=yes ;;
+        *) services="$services $1" ;;
+    esac
+    shift
+done
+command -v gh >/dev/null 2>&1 || die "needs the GitHub CLI (gh)"
+case $env in prod | staging) ;; *) die "-e takes prod or staging" ;; esac
+
+has_deploy() { gh api "repos/$owner/$1/contents/.github/workflows/deploy.yml" --silent 2>/dev/null; }
+latest() { gh release view -R "$owner/$1" --json tagName -q .tagName 2>/dev/null; }
+
+if [ "$list" = yes ]; then
+    for r in $repos; do
+        if has_deploy "$r"; then d=yes; else d=no; fi
+        printf '%-20s latest %-10s deploy.yml %s\n' "$r" "$(latest "$r" || echo none)" "$d"
+    done
+    exit 0
+fi
+
+[ -n "$services" ] || { usage; exit 2; }
+[ -z "$version" ] || [ "$(echo "$services" | wc -w)" -eq 1 ] \
+    || die "-v applies to one service; each repository has its own versions"
+
+for svc in $services; do
+    case " $repos " in *" $svc "*) ;; *) die "unknown service $svc (one of: $repos)" ;; esac
+    if ! has_deploy "$svc"; then
+        if [ "$all" = yes ]; then echo "$svc: no deploy.yml yet, skipped"; continue; fi
+        die "$svc has no deploy.yml yet"
+    fi
+    v=${version:-$(latest "$svc")} || true
+    [ -n "$v" ] || die "$svc has no releases"
+
+    before=$(gh run list -R "$owner/$svc" --workflow deploy.yml --limit 1 --json databaseId -q '.[0].databaseId // 0')
+    gh workflow run deploy.yml -R "$owner/$svc" -f env="$env" -f version="$v" >/dev/null
+    # The new run takes a moment to appear.
+    id=$before
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 2
+        id=$(gh run list -R "$owner/$svc" --workflow deploy.yml --limit 1 --json databaseId -q '.[0].databaseId // 0')
+        [ "$id" != "$before" ] && break
+    done
+    url=https://github.com/$owner/$svc/actions/runs/$id
+    [ "$id" != "$before" ] || url="https://github.com/$owner/$svc/actions/workflows/deploy.yml"
+    echo "$svc $v -> $env: $url"
+    [ "$env" = prod ] && echo "  waiting for your approval: open the link, Review deployments, Approve"
+
+    if [ "$watch" = yes ] && [ "$id" != "$before" ]; then
+        if gh run watch "$id" -R "$owner/$svc" --exit-status >/dev/null 2>&1; then
+            echo "  $svc $v is live on $env"
+        else
+            echo "  $svc $v did not deploy; see $url"
+            exit 1
+        fi
+    fi
+done
