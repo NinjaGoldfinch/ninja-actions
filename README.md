@@ -101,6 +101,12 @@ sudo ./infra/deploy-host-add.sh ninja-monitor --unit ninja-monitor.service \
     --exec-args '--config /etc/ninja-monitor/config.toml'
 ```
 
+A service whose boot can take long (a database migration, a large cache to
+load) needs `--health-wait <seconds>` covering its slowest boot (default 30).
+If the wait runs out after a forward-only migration has already applied,
+the automatic rollback starts the previous release on a database it may
+refuse, so err on the long side.
+
 After that, releases reach the host only through `deploy.yml`. The service's
 own installer still edits its configuration, but the binary it installs is no
 longer the one that runs.

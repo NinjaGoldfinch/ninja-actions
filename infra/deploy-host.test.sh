@@ -141,4 +141,15 @@ remote "$t/key" list >/dev/null 2>&1 && fail "the old key still works"
 remote "$t/key2" list | grep -qx 'v0.0.2 (live)' || fail "new key, or the live release changed"
 ok "re-running add rotates the key and keeps the live release"
 
+# --health-wait reaches ninja-deploy's settings; nonsense is refused before anything changes.
+add fakesvc --unit fakesvc --health-url http://127.0.0.1:18080/healthz \
+    --key "$(cat "$t/key2.pub")" --keep 2 --health-wait 120 >/dev/null
+grep -qx 'HEALTH_WAIT=120' /etc/ninja-deploy/fakesvc.conf || fail "HEALTH_WAIT not written"
+if add fakesvc --unit fakesvc --health-url http://127.0.0.1:18080/healthz \
+    --key "$(cat "$t/key2.pub")" --health-wait soon >/dev/null 2>&1; then
+    fail "--health-wait soon accepted"
+fi
+grep -qx 'HEALTH_WAIT=120' /etc/ninja-deploy/fakesvc.conf || fail "a refused run changed the settings"
+ok "--health-wait is written for ninja-deploy, and checked"
+
 echo "all deploy-host tests passed"

@@ -4,7 +4,7 @@
 # settings and sudo rule, and never touches releases already on disk.
 #
 #   sudo ./infra/deploy-host-add.sh <service> --unit <unit> --health-url <url> \
-#       --key '<ssh public key>' [--shared '<items>'] [--keep <n>] \
+#       --key '<ssh public key>' [--shared '<items>'] [--keep <n>] [--health-wait <s>] \
 #       [--adopt <installed binary> <its version> --exec-args '<arguments>']
 #
 #   --unit        systemd unit to restart, e.g. ninja-monitor.service
@@ -13,6 +13,8 @@
 #                 DEPLOY_SSH_KEY secret; it is forced to `ninja-deploy <service>`
 #   --shared      names under /srv/<service>/shared/ linked into every release
 #   --keep        releases kept on disk (default 5)
+#   --health-wait seconds a restarted release has to pass the health check (default 30);
+#                 make it cover the slowest boot, migrations included
 #   --adopt       move a service that is already running into /srv: copy the
 #                 installed binary in as the first release, point the unit at
 #                 /srv/<service>/current/<binary> with a drop-in, restart and
@@ -29,11 +31,11 @@ die() { echo "deploy-host-add.sh: $*" >&2; exit 1; }
 
 service=${1:-}
 case $service in
-    -h | --help) sed -n '2,22s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,23s/^# \{0,1\}//p' "$0"; exit 0 ;;
     '' | -* | *[!a-z0-9-]*) die "first argument: a service name (a-z, 0-9, -); try --help" ;;
 esac
 shift
-unit='' health_url='' key='' shared='' keep=5 adopt_bin='' adopt_version='' exec_args='' have_exec_args=no
+unit='' health_url='' key='' shared='' keep=5 health_wait=30 adopt_bin='' adopt_version='' exec_args='' have_exec_args=no
 while [ $# -gt 0 ]; do
     case $1 in
         --unit) shift; unit=${1:-} ;;
@@ -41,6 +43,7 @@ while [ $# -gt 0 ]; do
         --key) shift; key=${1:-} ;;
         --shared) shift; shared=${1:-} ;;
         --keep) shift; keep=${1:-} ;;
+        --health-wait) shift; health_wait=${1:-} ;;
         --adopt) shift; adopt_bin=${1:-}; shift; adopt_version=${1:-} ;;
         --exec-args) shift; exec_args=${1-}; have_exec_args=yes ;;
         *) die "unknown argument $1 (try --help)" ;;
@@ -68,6 +71,8 @@ esac
 case $health_url in *[!A-Za-z0-9:/._~?=\&%-]*) die "unexpected characters in --health-url" ;; esac
 case $keep in '' | *[!0-9]*) die "--keep takes a number" ;; esac
 [ "$keep" -ge 2 ] || die "--keep must be at least 2 (the live release and the one before)"
+case $health_wait in '' | *[!0-9]*) die "--health-wait takes a number of seconds" ;; esac
+[ "$health_wait" -ge 5 ] || die "--health-wait must be at least 5 seconds"
 case $shared in *[!A-Za-z0-9._\ -]*) die "--shared takes space-separated file names" ;; esac
 
 # A bare public key: type, base64, optional comment. No options, which this
@@ -107,6 +112,7 @@ conf=$etc/$service.conf
     printf "HEALTH_URL='%s'\n" "$health_url"
     printf "SHARED='%s'\n" "$shared"
     printf "KEEP=%s\n" "$keep"
+    printf "HEALTH_WAIT=%s\n" "$health_wait"
 } > "$conf.new"
 chmod 0644 "$conf.new"
 mv -f "$conf.new" "$conf"
@@ -138,10 +144,10 @@ echo "authorized the key for $service in $keys"
 
 json_version() { sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p'; }
 
-# Up to 30 s for the health URL to answer with the expected version.
+# Up to --health-wait seconds for the health URL to answer with the expected version.
 healthy() {
     want=${1#v} i=0 body=
-    while [ "$i" -lt 30 ]; do
+    while [ "$i" -lt "$health_wait" ]; do
         if body=$(curl -fsS --max-time 2 "$health_url" 2>/dev/null); then
             got=$(printf '%s' "$body" | json_version)
             if [ -z "$got" ] || [ "${got#v}" = "$want" ]; then
@@ -152,7 +158,7 @@ healthy() {
         sleep 1
         i=$((i + 1))
     done
-    echo "not healthy after 30 s; last response: ${body:-none}"
+    echo "not healthy after $health_wait s; last response: ${body:-none}"
     return 1
 }
 
