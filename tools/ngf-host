@@ -86,6 +86,7 @@ status_deploy() {
   local name=$1 repo=${2#deploy:} service=${4:-$1} latest live running state
   latest=$(latest_tag "$repo")
   live=$(jq -r '.version // "?"' "/srv/$service/live.json" 2>/dev/null || echo none)
+  # shellcheck disable=SC1090 # the service's ninja-deploy settings, for HEALTH_URL
   running=$( (. "/etc/ninja-deploy/$service.conf" && curl -fsS --max-time 2 "$HEALTH_URL") 2>/dev/null \
              | jq -r '.version // empty' 2>/dev/null || true)
   running=${running:+v${running#v}}
