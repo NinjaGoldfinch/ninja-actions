@@ -38,6 +38,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 command -v gh >/dev/null 2>&1 || die "needs the GitHub CLI (gh)"
+gh auth status >/dev/null 2>&1 || die "gh is not logged in; run: gh auth login"
 case $env in prod | staging) ;; *) die "-e takes prod or staging" ;; esac
 
 has_deploy() { gh api "repos/$owner/$1/contents/.github/workflows/deploy.yml" --silent 2>/dev/null; }
