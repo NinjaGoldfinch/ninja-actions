@@ -28,7 +28,7 @@ jobs:
   deploy-host:
     name: Deploy host (end to end)
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,3 +41,80 @@ jobs:
 
       - name: Setup, adopt, deploy over SSH, roll back, rotate the key
         run: sudo CI=true sh infra/deploy-host.test.sh
+
+      # The deploy action itself, against the host the test above left: a new
+      # version (download, checksum, upload, activate) and a broken one (rolled
+      # back, the step fails). A stand-in gh serves the release from disk.
+      - name: A host and a release for the deploy action
+        id: prep
+        run: |
+          set -eu
+          w=$RUNNER_TEMP/action-test
+          mkdir -p "$w/rel" "$w/bin"
+          ssh-keygen -q -t ed25519 -N '' -C ci-action -f "$w/key"
+          sudo sh infra/deploy-host-add.sh fakesvc --unit fakesvc --health-url http://127.0.0.1:18080/healthz \
+            --key "$(cat "$w/key.pub")" --keep 3 --health-wait 10 >/dev/null
+          pkg() {
+            rm -rf "$w/pkg" && mkdir -p "$w/pkg/fakesvc" "$w/rel/$1"
+            cp -L /usr/local/bin/fakesvc "$w/pkg/fakesvc/"
+            printf '{"version":"%s","commit":"c%s","built_at":"x"}\n' "$1" "$1" > "$w/pkg/fakesvc/version.json"
+            if [ "${2:-}" = broken ]; then touch "$w/pkg/fakesvc/broken"; fi
+            tar -czf "$w/rel/$1/fakesvc.tar.gz" -C "$w/pkg" fakesvc
+            (cd "$w/rel/$1" && sha256sum fakesvc.tar.gz > SHA256SUMS)
+          }
+          pkg v0.1.0
+          pkg v0.1.1 broken
+          cat > "$w/bin/gh" <<EOF
+          #!/bin/sh
+          [ "\$1 \$2" = "release download" ] || exit 2
+          tag=\$3; shift 3; dir=.
+          while [ \$# -gt 0 ]; do [ "\$1" = -D ] && { dir=\$2; shift; }; shift; done
+          cp "$w/rel/\$tag/"* "\$dir/"
+          EOF
+          chmod +x "$w/bin/gh"
+          echo "$w/bin" >> "$GITHUB_PATH"
+          {
+            echo 'key<<KEY'; cat "$w/key"; echo KEY
+            echo "known_hosts=$(ssh-keyscan -t ed25519 127.0.0.1 2>/dev/null)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy a new version through the action
+        id: up
+        uses: ./deploy
+        with:
+          service: fakesvc
+          version: v0.1.0
+          asset: fakesvc.tar.gz
+          host: 127.0.0.1
+          known-hosts: ${{ steps.prep.outputs.known_hosts }}
+          ssh-key: ${{ steps.prep.outputs.key }}
+
+      - name: It is live
+        env:
+          RESULT: ${{ steps.up.outputs.result }}
+        run: |
+          test "$RESULT" = success
+          curl -fsS http://127.0.0.1:18080/healthz | grep -q '"version":"0.1.0"'
+          test "$(readlink /srv/fakesvc/current)" = /srv/fakesvc/releases/v0.1.0
+
+      - name: Deploy a broken version through the action
+        id: broken
+        continue-on-error: true
+        uses: ./deploy
+        with:
+          service: fakesvc
+          version: v0.1.1
+          asset: fakesvc.tar.gz
+          host: 127.0.0.1
+          known-hosts: ${{ steps.prep.outputs.known_hosts }}
+          ssh-key: ${{ steps.prep.outputs.key }}
+
+      - name: It failed and rolled back
+        env:
+          OUTCOME: ${{ steps.broken.outcome }}
+          RESULT: ${{ steps.broken.outputs.result }}
+        run: |
+          test "$OUTCOME" = failure
+          test "$RESULT" = failure
+          curl -fsS http://127.0.0.1:18080/healthz | grep -q '"version":"0.1.0"'
+          test "$(readlink /srv/fakesvc/current)" = /srv/fakesvc/releases/v0.1.0
