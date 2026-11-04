@@ -234,6 +234,23 @@ If the wait runs out after a forward-only migration has already applied,
 the automatic rollback starts the previous release on a database it may
 refuse, so err on the long side.
 
+`--smoke-urls '<url> <url>'` adds pages the release must serve (2xx, three
+tries) once its health check passes, or the deploy rolls back as if it were
+unhealthy. Loopback `http://` URLs only, and only pages that depend on
+nothing else: one that needs another service (riot-proxy, a database on
+another host) would roll back a good release whenever that service is down.
+The site, for example:
+
+```sh
+sudo ./infra/deploy-host-add.sh ninjagoldfinch-lol --unit ninjagoldfinch-lol.service \
+    --health-url http://127.0.0.1:3000/healthz --key '<the .pub line>' \
+    --smoke-urls 'http://127.0.0.1:3000/ http://127.0.0.1:3000/about'
+```
+
+Re-running `deploy-host-add.sh` rewrites all of a service's settings, so
+pass the same `--smoke-urls` (and `--health-wait`, `--shared`, `--keep`)
+again, or they go back to their defaults.
+
 After that, releases reach the host only through `deploy.yml`. The service's
 own installer still edits its configuration, but the binary it installs is no
 longer the one that runs.

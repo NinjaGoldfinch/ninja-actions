@@ -229,4 +229,18 @@ fi
 grep -qx 'HEALTH_WAIT=120' /etc/ninja-deploy/fakesvc.conf || fail "a refused run changed the settings"
 ok "--health-wait is written for ninja-deploy, and checked"
 
+# --smoke-urls reaches ninja-deploy's settings too; a non-loopback URL is refused first.
+add fakesvc --unit fakesvc --health-url http://127.0.0.1:18080/healthz \
+    --key "$(cat "$t/key2.pub")" --keep 2 --health-wait 120 \
+    --smoke-urls ' http://127.0.0.1:18080/healthz   http://127.0.0.1:18080/healthz?x=1 ' >/dev/null
+grep -qx "SMOKE_URLS='http://127.0.0.1:18080/healthz http://127.0.0.1:18080/healthz?x=1'" /etc/ninja-deploy/fakesvc.conf \
+    || fail "SMOKE_URLS not written: $(grep SMOKE /etc/ninja-deploy/fakesvc.conf)"
+remote "$t/key2" activate v0.0.2 | grep -q 'smoke checks passed' || fail "activate did not run the smoke checks"
+if add fakesvc --unit fakesvc --health-url http://127.0.0.1:18080/healthz \
+    --key "$(cat "$t/key2.pub")" --smoke-urls 'https://example.com/' >/dev/null 2>&1; then
+    fail "a non-loopback smoke URL accepted"
+fi
+grep -q "SMOKE_URLS='http://127.0.0.1:18080/healthz " /etc/ninja-deploy/fakesvc.conf || fail "a refused run changed SMOKE_URLS"
+ok "--smoke-urls is written for ninja-deploy, checked, and run on activate"
+
 echo "all deploy-host tests passed"

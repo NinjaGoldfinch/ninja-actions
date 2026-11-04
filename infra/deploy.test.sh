@@ -21,7 +21,8 @@ HEALTH_WAIT=3
 EOF
 
 # `sudo -n systemctl restart|status svc`: a release containing `broken`
-# answers with the wrong version, as if the new process never came up.
+# answers with the wrong version, as if the new process never came up; one
+# containing `nopage` is healthy but its /page is gone (404).
 cat > "$t/bin/sudo" <<EOF
 #!/bin/sh
 [ "\$1" = -n ] && shift
@@ -30,7 +31,8 @@ case \$2 in
 restart)
     cur=\$(readlink "$t/srv/svc/current")
     if [ -e "\$cur/broken" ]; then v=0.0.0; else v=\${cur##*/v}; fi
-    printf '{"status":"ok","version":"%s"}' "\$v" > "$t/www/healthz" ;;
+    printf '{"status":"ok","version":"%s"}' "\$v" > "$t/www/healthz"
+    if [ -e "\$cur/nopage" ]; then rm -f "$t/www/page"; else echo ok > "$t/www/page"; fi ;;
 status) echo "svc status" ;;
 esac
 EOF
@@ -40,10 +42,10 @@ server=$!
 
 export PATH="$t/bin:$PATH" NINJA_DEPLOY_ETC="$t/etc" NINJA_DEPLOY_SRV="$t/srv"
 run() { SSH_ORIGINAL_COMMAND="$*" sh "$here/deploy.sh" svc; }
-tarball() { # <version> [broken]
+tarball() { # <version> [broken|nopage]
     rm -rf "$t/pkg" && mkdir -p "$t/pkg/svc"
     printf '{"version":"%s","commit":"abc%s","built_at":"x"}\n' "$1" "$1" > "$t/pkg/svc/version.json"
-    [ $# -gt 1 ] && touch "$t/pkg/svc/broken"
+    [ $# -gt 1 ] && touch "$t/pkg/svc/$2"
     tar -czf - -C "$t/pkg" svc
 }
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -92,5 +94,18 @@ tar -czf - -C "$here" deploy.sh | run upload v2.0.0 2>/dev/null && fail "accepte
 [ -e "$t/srv/svc/releases/v2.0.0" ] && fail "left a bad upload behind"
 SSH_ORIGINAL_COMMAND=list sh "$here/deploy.sh" other 2>/dev/null && fail "accepted an unknown service"
 ok "rejects bad versions, actions, services and releases"
+
+# SMOKE_URLS: checked once healthy; a failing page rolls back like a failed health check.
+echo "SMOKE_URLS='http://127.0.0.1:$port/page'" >> "$t/etc/svc.conf"
+tarball v1.4.0 nopage | run upload v1.4.0 >/dev/null
+out=$(run activate v1.4.0) && fail "a release whose smoke URL fails was activated"
+echo "$out" | grep -q "smoke check failed: http://127.0.0.1:$port/page answered 404" || fail "no smoke failure message: $out"
+[ "$(live)" = v1.3.0 ] || fail "not rolled back after a failed smoke check, live is $(live)"
+grep -q '"version":"v1.3.0"' "$t/srv/svc/live.json" || fail "live.json changed by a failed smoke check"
+tarball v1.5.0 | run upload v1.5.0 >/dev/null
+out=$(run activate v1.5.0) || fail "activate with passing smoke URLs: $out"
+echo "$out" | grep -q 'smoke checks passed' || fail "no smoke pass message: $out"
+[ "$(live)" = v1.5.0 ] || fail "live is $(live) after a passing smoke check"
+ok "SMOKE_URLS: a failing page rolls back, passing pages go live"
 
 echo "all deploy.sh tests passed"

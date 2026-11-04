@@ -21,7 +21,8 @@
 #
 # Settings, all root-owned:
 #   /etc/ninja-deploy/env              ENV=prod (or staging)
-#   /etc/ninja-deploy/<service>.conf   UNIT=, HEALTH_URL=, optional SHARED=, KEEP=5, HEALTH_WAIT=30
+#   /etc/ninja-deploy/<service>.conf   UNIT=, HEALTH_URL=, optional SHARED=, KEEP=5, HEALTH_WAIT=30,
+#                                      SMOKE_URLS= (loopback URLs that must answer 2xx once healthy)
 #
 # The deploy user needs sudo for exactly `systemctl restart <unit>` and
 # `systemctl status <unit>`, nothing else.
@@ -41,7 +42,7 @@ srv=${NINJA_DEPLOY_SRV:-/srv}
 
 [ -r "$etc/env" ] || die "no $etc/env"
 [ -r "$etc/$service.conf" ] || die "unknown service $service"
-ENV='' UNIT='' HEALTH_URL='' SHARED='' KEEP=5 HEALTH_WAIT=30
+ENV='' UNIT='' HEALTH_URL='' SHARED='' KEEP=5 HEALTH_WAIT=30 SMOKE_URLS=''
 # shellcheck disable=SC1090,SC1091 # root-owned settings files
 . "$etc/env"
 # shellcheck disable=SC1090
@@ -85,6 +86,27 @@ healthy() {
     done
     echo "not healthy after $HEALTH_WAIT s; last response: ${body:-none}"
     return 1
+}
+
+# After the health check: each of SMOKE_URLS must answer 2xx, with three tries a
+# second apart, so a release whose health check passes but whose pages fail
+# still rolls back. Only pages that depend on nothing else belong here: one
+# that needs another service would roll back a good release during its outage.
+smoke() {
+    for url in $SMOKE_URLS; do
+        n=0
+        while :; do
+            code=$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' "$url" 2>/dev/null) || true
+            case $code in 2??) break ;; esac
+            n=$((n + 1))
+            if [ "$n" -ge 3 ]; then
+                echo "smoke check failed: $url answered ${code:-nothing}"
+                return 1
+            fi
+            sleep 1
+        done
+    done
+    [ -z "$SMOKE_URLS" ] || echo "smoke checks passed: $SMOKE_URLS"
 }
 
 point_current_at() {
@@ -132,7 +154,7 @@ activate)
     echo "activating $service $version on $ENV (was ${previous##*/})"
     point_current_at "$target"
     restart
-    if healthy "$version"; then
+    if healthy "$version" && smoke; then
         commit=$(json_field commit "$(cat "$target/version.json")")
         now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         printf '{"service":"%s","env":"%s","version":"%s","commit":"%s","deployed_at":"%s"}\n' \
