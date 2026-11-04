@@ -8,6 +8,7 @@
 #   ngf-host update --force [...]     # rebuild/restart even if nothing changed
 #   ngf-host update --dry-run [...]   # show what would happen
 #   ngf-host update <project> --version v1.2.3   # deploy: projects only, e.g. to roll back
+#   ngf-host update <project> --unverified 'reason'   # prod: deploy a version that has not passed staging
 #   ngf-host self-update [ref]        # replace this script with tools/ngf-host at ref (default v1)
 #
 # Config: ~/.config/ngf-host/projects.conf, one line per project.
@@ -22,6 +23,11 @@
 # `sudo -u deploy ninja-deploy <service>` (has, upload, activate) on this box.
 # That skips the GitHub prod approval and the Actions history; from your own
 # machine, ngf-deploy <service> deploys through CI instead.
+# On a prod host (ENV=prod in /etc/ninja-deploy/env) it keeps the same rule as
+# CI: the release tag's commit must carry staging/smoke=success (it passed on
+# staging) or prod/deployed=success (it has been live, so a rollback), or the
+# deploy is refused. --unverified '<reason>' overrides that for one project and
+# writes the reason to the log. Staging hosts deploy anything.
 #
 # Git-checkout projects (pull, build in place, restart):
 #   name|path|branch|systemd-unit|build-command|user
@@ -50,6 +56,7 @@ DEPLOY_USER="${NGF_HOST_DEPLOY_USER:-deploy}"
 ETC="${NGF_HOST_ETC:-/etc/ninja-deploy}"
 SRV="${NGF_HOST_SRV:-/srv}"
 SELF_REPO="${NGF_HOST_SELF_REPO:-NinjaGoldfinch/ninja-actions}"
+STATUS_API="${NGF_HOST_STATUS_API:-https://api.github.com}"   # overridable for testing the prod gate
 
 usage() { sed -n '2,/^$/p' "$0"; }
 cmd=status
@@ -57,7 +64,7 @@ case "${1:-}" in
   status|update|self-update) cmd=$1; shift ;;
   -h|--help|help) usage; exit 0 ;;
 esac
-force=0 dry=0 want_version=''; only=()
+force=0 dry=0 want_version='' unverified=''; only=()
 while (( $# )); do
   case "$1" in
     --force)   force=1 ;;
@@ -65,14 +72,21 @@ while (( $# )); do
     --version)
       (( $# >= 2 )) || { echo "--version takes a release tag such as v1.2.3" >&2; exit 2; }
       shift; want_version=$1 ;;
+    --unverified)
+      (( $# >= 2 )) && [[ -n $2 && $2 != -* ]] \
+        || { echo "--unverified takes a reason, e.g. --unverified 'hotfix for outage, staging down'" >&2; exit 2; }
+      shift; unverified=$1 ;;
     -h|--help) usage; exit 0 ;;
     -*)        echo "unknown option $1 (try --help)" >&2; exit 2 ;;
     *)         only+=("$1") ;;
   esac
   shift
 done
-if [[ $cmd != update ]] && { (( force || dry )) || [[ -n $want_version ]]; }; then
-  echo "--force, --dry-run and --version belong to: ngf-host update" >&2; exit 2
+if [[ $cmd != update ]] && { (( force || dry )) || [[ -n $want_version || -n $unverified ]]; }; then
+  echo "--force, --dry-run, --version and --unverified belong to: ngf-host update" >&2; exit 2
+fi
+if [[ -n $unverified ]] && (( ${#only[@]} != 1 )); then
+  echo "--unverified needs exactly one project" >&2; exit 2
 fi
 if [[ -n $want_version ]]; then
   [[ $want_version =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
@@ -248,6 +262,33 @@ ninja_deploy() {
   sudo -u "$DEPLOY_USER" env SSH_ORIGINAL_COMMAND="$*" "$NINJA_DEPLOY" "$service"
 }
 
+# On a prod host, the rule CI's deploy action enforces with require-status: the
+# tag's commit needs staging/smoke or prod/deployed at success. A release being
+# on disk proves nothing (one that failed its health check stays there too).
+# An unreadable status fails closed.
+prod_gate() {
+  local name=$1 repo=$2 tag=$3 host_env statuses ctx state why
+  host_env=$(sed -n 's/^ENV=//p' "$ETC/env" 2>/dev/null)
+  [[ $host_env == prod ]] || return 0
+  if statuses=$(gh_api "$STATUS_API/repos/$repo/commits/$tag/status"); then
+    for ctx in staging/smoke prod/deployed; do
+      state=$(jq -r --arg c "$ctx" '[.statuses[]? | select(.context == $c) | .state][0] // empty' <<<"$statuses")
+      if [[ $state == success ]]; then
+        say "$name" "$tag has $ctx=success"; return 0
+      fi
+    done
+    why="$tag has neither staging/smoke nor prod/deployed at success"
+  else
+    why="could not read the commit statuses of $tag"
+  fi
+  if [[ -n $unverified ]]; then
+    say "$name" "UNVERIFIED DEPLOY to prod: $why. Reason given: $unverified"
+    return 0
+  fi
+  say "$name" "REFUSED: $why. Deploy it to staging first, or override with --unverified '<reason>'"
+  return 1
+}
+
 update_deploy() {
   local name=$1 repo=${2#deploy:} asset=$3 service=${4:-$1} sums=${5:-SHA256SUMS}
   if [[ ! -r "$ETC/$service.conf" || ! -x "$NINJA_DEPLOY" ]]; then
@@ -267,6 +308,8 @@ update_deploy() {
     say "$name" "up to date ($tag)"; return 3
   fi
 
+  # The live version is already in production; --force only restarts it.
+  if [[ "$tag" != "$live" ]]; then prod_gate "$name" "$repo" "$tag" || return 1; fi
   say "$name" "deploying $tag (live: $live) through ninja-deploy"
   # What `ninja-deploy has` checks, read directly: the directories are
   # world-readable, so this needs no sudo (a dry run never asks for a password),
