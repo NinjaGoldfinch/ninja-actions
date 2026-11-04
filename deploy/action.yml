@@ -57,7 +57,10 @@ runs:
         SSH_KEY: ${{ inputs.ssh-key }}
         GH_TOKEN: ${{ inputs.token }}
       run: |
-        set -uo pipefail
+        # GitHub runs this with bash -e; every status below is handled by hand, and
+        # under -e a remote `has` answering 1 (not on disk) ended the step silently.
+        set -u -o pipefail
+        set +e
         key=$RUNNER_TEMP/deploy-key kh=$RUNNER_TEMP/deploy-known-hosts log=$RUNNER_TEMP/deploy.log
         (umask 077; printf '%s\n' "$SSH_KEY" > "$key"; printf '%s\n' "$KNOWN_HOSTS" > "$kh")
         trap 'rm -f "$key" "$kh"' EXIT
@@ -69,8 +72,9 @@ runs:
         started=$(date +%s)
 
         deploy() {
-          remote has "$VERSION"
-          case $? in
+          rc=0
+          remote has "$VERSION" || rc=$?
+          case $rc in
           0) echo "$VERSION is already on $HOST, skipping the upload" ;;
           1)
             dl=$RUNNER_TEMP/release
