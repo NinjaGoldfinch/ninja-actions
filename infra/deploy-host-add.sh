@@ -4,8 +4,8 @@
 # settings and sudo rule, and never touches releases already on disk.
 #
 #   sudo ./infra/deploy-host-add.sh <service> --unit <unit> --health-url <url> \
-#       --key '<ssh public key>' [--shared '<items>'] [--keep <n>] \
-#       [--adopt <installed binary> <its version> --exec-args '<arguments>']
+#       --key '<ssh public key>' [--shared '<items>'] [--keep <n>] [--health-wait <s>] \
+#       [--adopt <installed binary> <its version> --exec-args '<arguments>' [--link]]
 #
 #   --unit        systemd unit to restart, e.g. ninja-monitor.service
 #   --health-url  loopback URL answering 2xx, with "version" in its JSON if it can
@@ -13,12 +13,18 @@
 #                 DEPLOY_SSH_KEY secret; it is forced to `ninja-deploy <service>`
 #   --shared      names under /srv/<service>/shared/ linked into every release
 #   --keep        releases kept on disk (default 5)
+#   --health-wait seconds a restarted release has to pass the health check (default 30);
+#                 make it cover the slowest boot, migrations included
 #   --adopt       move a service that is already running into /srv: copy the
 #                 installed binary in as the first release, point the unit at
 #                 /srv/<service>/current/<binary> with a drop-in, restart and
 #                 health-check it. If it is not healthy the drop-in is removed
 #                 and the old setup restarted. --exec-args gives the arguments
 #                 for the new ExecStart (the unit's current ones, usually).
+#   --link        with --adopt: replace the installed binary by a symlink to
+#                 /srv/<service>/current/<binary> (the original is kept as
+#                 <path>.pre-deploy), so helpers and runbooks that call the old
+#                 path run the live release. Safe to add on a later run.
 set -eu
 
 user=deploy
@@ -29,11 +35,11 @@ die() { echo "deploy-host-add.sh: $*" >&2; exit 1; }
 
 service=${1:-}
 case $service in
-    -h | --help) sed -n '2,22s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,27s/^# \{0,1\}//p' "$0"; exit 0 ;;
     '' | -* | *[!a-z0-9-]*) die "first argument: a service name (a-z, 0-9, -); try --help" ;;
 esac
 shift
-unit='' health_url='' key='' shared='' keep=5 adopt_bin='' adopt_version='' exec_args='' have_exec_args=no
+unit='' health_url='' key='' shared='' keep=5 health_wait=30 adopt_bin='' adopt_version='' exec_args='' have_exec_args=no link=no
 while [ $# -gt 0 ]; do
     case $1 in
         --unit) shift; unit=${1:-} ;;
@@ -41,8 +47,10 @@ while [ $# -gt 0 ]; do
         --key) shift; key=${1:-} ;;
         --shared) shift; shared=${1:-} ;;
         --keep) shift; keep=${1:-} ;;
+        --health-wait) shift; health_wait=${1:-} ;;
         --adopt) shift; adopt_bin=${1:-}; shift; adopt_version=${1:-} ;;
         --exec-args) shift; exec_args=${1-}; have_exec_args=yes ;;
+        --link) link=yes ;;
         *) die "unknown argument $1 (try --help)" ;;
     esac
     [ $# -gt 0 ] && shift
@@ -68,6 +76,8 @@ esac
 case $health_url in *[!A-Za-z0-9:/._~?=\&%-]*) die "unexpected characters in --health-url" ;; esac
 case $keep in '' | *[!0-9]*) die "--keep takes a number" ;; esac
 [ "$keep" -ge 2 ] || die "--keep must be at least 2 (the live release and the one before)"
+case $health_wait in '' | *[!0-9]*) die "--health-wait takes a number of seconds" ;; esac
+[ "$health_wait" -ge 5 ] || die "--health-wait must be at least 5 seconds"
 case $shared in *[!A-Za-z0-9._\ -]*) die "--shared takes space-separated file names" ;; esac
 
 # A bare public key: type, base64, optional comment. No options, which this
@@ -75,6 +85,9 @@ case $shared in *[!A-Za-z0-9._\ -]*) die "--shared takes space-separated file na
 printf '%s' "$key" | grep -Eqx '(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com) [A-Za-z0-9+/]+=* ?[A-Za-z0-9@._+-]*' \
     || die "--key must be one public key line, e.g. 'ssh-ed25519 AAAA... ci-$service'"
 
+if [ "$link" = yes ] && [ -z "$adopt_bin" ]; then
+    die "--link goes with --adopt (it replaces the adopted binary)"
+fi
 if [ -n "$adopt_bin" ] || [ -n "$adopt_version" ]; then
     if [ ! -f "$adopt_bin" ] || [ ! -x "$adopt_bin" ]; then
         die "--adopt: $adopt_bin is not an executable file"
@@ -107,6 +120,7 @@ conf=$etc/$service.conf
     printf "HEALTH_URL='%s'\n" "$health_url"
     printf "SHARED='%s'\n" "$shared"
     printf "KEEP=%s\n" "$keep"
+    printf "HEALTH_WAIT=%s\n" "$health_wait"
 } > "$conf.new"
 chmod 0644 "$conf.new"
 mv -f "$conf.new" "$conf"
@@ -138,10 +152,10 @@ echo "authorized the key for $service in $keys"
 
 json_version() { sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p'; }
 
-# Up to 30 s for the health URL to answer with the expected version.
+# Up to --health-wait seconds for the health URL to answer with the expected version.
 healthy() {
     want=${1#v} i=0 body=
-    while [ "$i" -lt 30 ]; do
+    while [ "$i" -lt "$health_wait" ]; do
         if body=$(curl -fsS --max-time 2 "$health_url" 2>/dev/null); then
             got=$(printf '%s' "$body" | json_version)
             if [ -z "$got" ] || [ "${got#v}" = "$want" ]; then
@@ -152,7 +166,7 @@ healthy() {
         sleep 1
         i=$((i + 1))
     done
-    echo "not healthy after 30 s; last response: ${body:-none}"
+    echo "not healthy after $health_wait s; last response: ${body:-none}"
     return 1
 }
 
@@ -203,6 +217,18 @@ if [ -n "$adopt_bin" ]; then
             systemctl restart "$unit" || true
             die "adoption failed; $unit is back on its own ExecStart"
         fi
+    fi
+fi
+
+if [ "$link" = yes ] && [ -e "$root/current" ]; then
+    target=$root/current/$(basename "$adopt_bin")
+    if [ "$(readlink "$adopt_bin" 2>/dev/null)" = "$target" ]; then
+        echo "$adopt_bin already points at $target"
+    else
+        [ -e "$adopt_bin.pre-deploy" ] && die "$adopt_bin.pre-deploy exists; move it away first"
+        mv "$adopt_bin" "$adopt_bin.pre-deploy"
+        ln -s "$target" "$adopt_bin"
+        echo "$adopt_bin -> $target (the original is $adopt_bin.pre-deploy)"
     fi
 fi
 

@@ -92,6 +92,11 @@ that fails, the drop-in is removed and the old setup restarted, so nothing is
 left half moved. Deleting the drop-in later (then `systemctl daemon-reload`
 and a restart) goes back to the unit's own `ExecStart` just as well.
 
+Add `--link` when other tools call the installed path (an admin helper, a
+runbook): the installed binary is moved to `<path>.pre-deploy` and replaced
+by a symlink to `/srv/<service>/current/<binary>`, so they run whatever
+release is live instead of the one installed before adoption.
+
 ninja-monitor on the VPS, for example:
 
 ```sh
@@ -100,6 +105,12 @@ sudo ./infra/deploy-host-add.sh ninja-monitor --unit ninja-monitor.service \
     --adopt /usr/local/bin/ninja-monitor v0.2.1 \
     --exec-args '--config /etc/ninja-monitor/config.toml'
 ```
+
+A service whose boot can take long (a database migration, a large cache to
+load) needs `--health-wait <seconds>` covering its slowest boot (default 30).
+If the wait runs out after a forward-only migration has already applied,
+the automatic rollback starts the previous release on a database it may
+refuse, so err on the long side.
 
 After that, releases reach the host only through `deploy.yml`. The service's
 own installer still edits its configuration, but the binary it installs is no
