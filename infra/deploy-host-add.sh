@@ -6,6 +6,7 @@
 #   sudo ./infra/deploy-host-add.sh <service> --unit <unit> --health-url <url> \
 #       --key '<ssh public key>' [--shared '<items>'] [--keep <n>] [--health-wait <s>] \
 #       [--adopt <installed binary> <its version> --exec-args '<arguments>' [--link]]
+#       [--adopt-release <release .tar.gz> <its version> --exec-start '<command>']
 #
 #   --unit        systemd unit to restart, e.g. ninja-monitor.service
 #   --health-url  loopback URL answering 2xx, with "version" in its JSON if it can
@@ -25,6 +26,13 @@
 #                 /srv/<service>/current/<binary> (the original is kept as
 #                 <path>.pre-deploy), so helpers and runbooks that call the old
 #                 path run the live release. Safe to add on a later run.
+#   --adopt-release  the same move for a service that runs from a directory
+#                 (e.g. `node build` in a checkout): unpack a release tarball,
+#                 as CI uploads it, as the first release, and point the unit's
+#                 WorkingDirectory at /srv/<service>/current and its ExecStart
+#                 at --exec-start, a full command line (absolute program,
+#                 arguments relative to the release). The tarball's
+#                 version.json must name the version given.
 set -eu
 
 user=deploy
@@ -35,11 +43,11 @@ die() { echo "deploy-host-add.sh: $*" >&2; exit 1; }
 
 service=${1:-}
 case $service in
-    -h | --help) sed -n '2,27s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,35s/^# \{0,1\}//p' "$0"; exit 0 ;;
     '' | -* | *[!a-z0-9-]*) die "first argument: a service name (a-z, 0-9, -); try --help" ;;
 esac
 shift
-unit='' health_url='' key='' shared='' keep=5 health_wait=30 adopt_bin='' adopt_version='' exec_args='' have_exec_args=no link=no
+unit='' health_url='' key='' shared='' keep=5 health_wait=30 adopt_bin='' adopt_tar='' adopt_version='' exec_args='' have_exec_args=no exec_start='' link=no
 while [ $# -gt 0 ]; do
     case $1 in
         --unit) shift; unit=${1:-} ;;
@@ -49,7 +57,9 @@ while [ $# -gt 0 ]; do
         --keep) shift; keep=${1:-} ;;
         --health-wait) shift; health_wait=${1:-} ;;
         --adopt) shift; adopt_bin=${1:-}; shift; adopt_version=${1:-} ;;
+        --adopt-release) shift; adopt_tar=${1:-}; shift; adopt_version=${1:-} ;;
         --exec-args) shift; exec_args=${1-}; have_exec_args=yes ;;
+        --exec-start) shift; exec_start=${1:-} ;;
         --link) link=yes ;;
         *) die "unknown argument $1 (try --help)" ;;
     esac
@@ -85,18 +95,43 @@ case $shared in *[!A-Za-z0-9._\ -]*) die "--shared takes space-separated file na
 printf '%s' "$key" | grep -Eqx '(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com) [A-Za-z0-9+/]+=* ?[A-Za-z0-9@._+-]*' \
     || die "--key must be one public key line, e.g. 'ssh-ed25519 AAAA... ci-$service'"
 
+json_version() { sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p'; }
+nl='
+'
+
 if [ "$link" = yes ] && [ -z "$adopt_bin" ]; then
     die "--link goes with --adopt (it replaces the adopted binary)"
 fi
-if [ -n "$adopt_bin" ] || [ -n "$adopt_version" ]; then
+[ -n "$adopt_bin" ] && [ -n "$adopt_tar" ] && die "use --adopt or --adopt-release, not both"
+if [ -n "$adopt_bin" ] || [ -n "$adopt_tar" ] || [ -n "$adopt_version" ]; then
+    printf '%s' "$adopt_version" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' \
+        || die "adopting: version '$adopt_version' should look like v1.2.3"
+fi
+if [ -n "$adopt_tar" ]; then
+    [ -f "$adopt_tar" ] || die "--adopt-release: $adopt_tar is not a file"
+    [ "$have_exec_args" = no ] || die "--adopt-release takes --exec-start (the whole command), not --exec-args"
+    case $exec_start in
+        '') die "--adopt-release needs --exec-start, e.g. '/usr/bin/node build'" ;;
+        /*) ;;
+        *) die "--exec-start must start with an absolute program path" ;;
+    esac
+    case $exec_start in *"$nl"*) die "--exec-start must be one line" ;; esac
+    # As ninja-deploy unpacks it: one top-level directory, version.json in it.
+    # An unreadable file lists nothing, and one without version.json has no version.
+    tops=$(tar -tzf "$adopt_tar" 2>/dev/null | cut -d/ -f1 | sort -u)
+    case $tops in '' | *"$nl"* | .) die "--adopt-release: $adopt_tar must be a .tar.gz holding one top-level directory" ;; esac
+    tar_version=$(tar -xzOf "$adopt_tar" "$tops/version.json" 2>/dev/null | json_version)
+    [ -n "$tar_version" ] || die "--adopt-release: $adopt_tar has no version in $tops/version.json"
+    [ "${tar_version#v}" = "${adopt_version#v}" ] \
+        || die "--adopt-release: $adopt_tar is $tar_version, not $adopt_version"
+elif [ -n "$exec_start" ]; then
+    die "--exec-start goes with --adopt-release"
+fi
+if [ -n "$adopt_bin" ] || { [ -z "$adopt_tar" ] && [ -n "$adopt_version" ]; }; then
     if [ ! -f "$adopt_bin" ] || [ ! -x "$adopt_bin" ]; then
         die "--adopt: $adopt_bin is not an executable file"
     fi
-    printf '%s' "$adopt_version" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' \
-        || die "--adopt: version '$adopt_version' should look like v1.2.3"
     [ "$have_exec_args" = yes ] || die "--adopt needs --exec-args (use '' for none)"
-    nl='
-'
     case $exec_args in *"$nl"*) die "--exec-args must be one line" ;; esac
 fi
 
@@ -150,8 +185,6 @@ chmod 0600 "$keys.new"
 mv -f "$keys.new" "$keys"
 echo "authorized the key for $service in $keys"
 
-json_version() { sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p'; }
-
 # Up to --health-wait seconds for the health URL to answer with the expected version.
 healthy() {
     want=${1#v} i=0 body=
@@ -170,21 +203,31 @@ healthy() {
     return 1
 }
 
-if [ -n "$adopt_bin" ]; then
+if [ -n "$adopt_bin" ] || [ -n "$adopt_tar" ]; then
     dropin_dir=/etc/systemd/system/$unit.d
     dropin=$dropin_dir/ninja-deploy.conf
     if [ -e "$root/current" ]; then
         echo "$root/current already exists; not adopting again"
     else
-        name=$(basename "$adopt_bin")
         release=$root/releases/$adopt_version
         [ -e "$release" ] && die "$release already exists; remove it or adopt under another version"
         tmp=$(mktemp -d "$root/releases/.adopt.XXXXXX")
-        cp "$adopt_bin" "$tmp/$name"
-        printf '{"version":"%s","commit":"adopted","built_at":"%s"}\n' \
-            "$adopt_version" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp/version.json"
-        chmod 0755 "$tmp" "$tmp/$name"
-        chmod 0644 "$tmp/version.json"
+        if [ -n "$adopt_tar" ]; then
+            # Exactly as ninja-deploy's upload unpacks it.
+            tar -xzf "$adopt_tar" -C "$tmp" --strip-components=1 --no-same-owner
+            chmod 0755 "$tmp"
+            command=$exec_start
+            workdir=$root/current
+        else
+            name=$(basename "$adopt_bin")
+            cp "$adopt_bin" "$tmp/$name"
+            printf '{"version":"%s","commit":"adopted","built_at":"%s"}\n' \
+                "$adopt_version" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp/version.json"
+            chmod 0755 "$tmp" "$tmp/$name"
+            chmod 0644 "$tmp/version.json"
+            command="$root/current/$name${exec_args:+ $exec_args}"
+            workdir=''
+        fi
         chown -R "$user:$user" "$tmp"
         mv -T "$tmp" "$release"
         # Absolute, as ninja-deploy writes it.
@@ -194,17 +237,22 @@ if [ -n "$adopt_bin" ]; then
         install -d -m 0755 "$dropin_dir"
         {
             echo "# Written by ninja-actions infra/deploy-host-add.sh: run the release"
-            echo "# ninja-deploy activated. Delete this file to go back to the unit's own ExecStart."
+            echo "# ninja-deploy activated. Delete this file to go back to the unit's own settings."
             echo "[Service]"
+            [ -z "$workdir" ] || echo "WorkingDirectory=$workdir"
             echo "ExecStart="
-            echo "ExecStart=$root/current/$name${exec_args:+ $exec_args}"
+            echo "ExecStart=$command"
         } > "$dropin"
         systemctl daemon-reload
-        echo "restarting $unit from $root/current/$name"
+        echo "restarting $unit: $command${workdir:+ (in $workdir)}"
         systemctl restart "$unit" || true
         if healthy "$adopt_version"; then
-            printf '{"service":"%s","env":"%s","version":"%s","commit":"adopted","deployed_at":"%s"}\n' \
-                "$service" "$(sed -n 's/^ENV=//p' "$etc/env")" "$adopt_version" \
+            commit=adopted
+            if [ -n "$adopt_tar" ]; then
+                commit=$(sed -n 's/.*"commit" *: *"\([^"]*\)".*/\1/p' "$release/version.json")
+            fi
+            printf '{"service":"%s","env":"%s","version":"%s","commit":"%s","deployed_at":"%s"}\n' \
+                "$service" "$(sed -n 's/^ENV=//p' "$etc/env")" "$adopt_version" "$commit" \
                 "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$root/live.json"
             chown "$user:$user" "$root/live.json"
             echo "adopted $service $adopt_version into $root"
@@ -215,7 +263,7 @@ if [ -n "$adopt_bin" ]; then
             rm -rf "${release:?}"
             systemctl daemon-reload
             systemctl restart "$unit" || true
-            die "adoption failed; $unit is back on its own ExecStart"
+            die "adoption failed; $unit is back on its own settings"
         fi
     fi
 fi
