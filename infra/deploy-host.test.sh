@@ -96,6 +96,79 @@ if [ -e /srv/badsvc/current ] || [ -e /srv/badsvc/releases/v0.0.1 ]; then fail "
 [ "$(version_on 18081)" = 0.0.1 ] || fail "service not restored after a failed adopt"
 ok "failed adoption restores the old setup"
 
+# A service that runs from a directory, as the site runs `node build` in its
+# checkout: `/bin/sh app/run` in /opt/fakeweb, reporting ./version.json.
+mkdir -p /opt/fakeweb/app
+cat > /opt/fakeweb/app/run <<'EOF'
+#!/bin/sh
+v=$(sed -n 's/.*"version" *: *"v\{0,1\}\([^"]*\)".*/\1/p' version.json 2>/dev/null || true)
+[ -n "$v" ] || v=0.0.1
+[ -e broken ] && v=0.0.0
+printf '{"ok":true,"version":"%s"}' "$v" > "$RUNTIME_DIRECTORY/healthz"
+exec python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$RUNTIME_DIRECTORY"
+EOF
+for svc in fakeweb:18082 badweb:18083; do
+    cat > "/etc/systemd/system/${svc%%:*}.service" <<EOF
+[Service]
+DynamicUser=yes
+RuntimeDirectory=${svc%%:*}
+Environment=PORT=${svc##*:}
+WorkingDirectory=/opt/fakeweb
+ExecStart=/bin/sh app/run
+EOF
+done
+systemctl daemon-reload
+systemctl start fakeweb badweb
+[ "$(version_on 18082)" = 0.0.1 ] || fail "fake web service did not start"
+
+webpkg() { # <version> [broken]: a release tarball, as a release workflow builds it
+    rm -rf "$t/web" && mkdir -p "$t/web/fakeweb/app"
+    cp /opt/fakeweb/app/run "$t/web/fakeweb/app/"
+    printf '{"version":"%s","commit":"c%s","built_at":"x"}\n' "$1" "$1" > "$t/web/fakeweb/version.json"
+    [ $# -gt 1 ] && touch "$t/web/fakeweb/broken"
+    tar -czf "$t/web-$1.tgz" -C "$t/web" fakeweb
+}
+ssh-keygen -q -t ed25519 -N '' -C ci-fakeweb -f "$t/key4"
+ssh-keygen -q -t ed25519 -N '' -C ci-badweb -f "$t/key5"
+webadd() { add fakeweb --unit fakeweb --health-url http://127.0.0.1:18082/healthz --key "$(cat "$t/key4.pub")" "$@"; }
+
+# Refused before anything changes: a tarball of another version, a relative program.
+webpkg v0.1.0
+webadd --adopt-release "$t/web-v0.1.0.tgz" v0.2.0 --exec-start '/bin/sh app/run' >/dev/null 2>&1 \
+    && fail "a tarball of another version adopted"
+webadd --adopt-release "$t/web-v0.1.0.tgz" v0.1.0 --exec-start 'sh app/run' >/dev/null 2>&1 \
+    && fail "a relative --exec-start accepted"
+webadd --adopt-release "$t/web-v0.1.0.tgz" v0.1.0 --exec-args 'app/run' >/dev/null 2>&1 \
+    && fail "--adopt-release without --exec-start accepted"
+[ ! -e /etc/ninja-deploy/fakeweb.conf ] || fail "a refused adoption left settings behind"
+ok "--adopt-release refuses a mismatched tarball or command before changing anything"
+
+webadd --keep 2 --adopt-release "$t/web-v0.1.0.tgz" v0.1.0 --exec-start '/bin/sh app/run' >/dev/null
+[ "$(readlink /srv/fakeweb/current)" = /srv/fakeweb/releases/v0.1.0 ] || fail "current after release adopt"
+[ "$(systemctl show -p WorkingDirectory --value fakeweb)" = /srv/fakeweb/current ] \
+    || fail "WorkingDirectory not current: $(systemctl show -p WorkingDirectory --value fakeweb)"
+[ "$(version_on 18082)" = 0.1.0 ] || fail "not serving the adopted release"
+grep -q '"version":"v0.1.0","commit":"cv0.1.0"' /srv/fakeweb/live.json || fail "live.json after release adopt: $(cat /srv/fakeweb/live.json)"
+[ "$(stat -c %U /srv/fakeweb/releases/v0.1.0/app/run)" = deploy ] || fail "release not owned by deploy"
+ok "--adopt-release moves a directory service onto a release in /srv"
+
+webpkg v0.1.1
+remote "$t/key4" upload v0.1.1 < "$t/web-v0.1.1.tgz" >/dev/null || fail "upload after release adopt"
+remote "$t/key4" activate v0.1.1 >/dev/null || fail "activate after release adopt"
+[ "$(version_on 18082)" = 0.1.1 ] || fail "restart did not follow current to v0.1.1"
+ok "a deploy after --adopt-release runs the new release's directory"
+
+webpkg v0.1.0 broken
+if add badweb --unit badweb --health-url http://127.0.0.1:18083/healthz --key "$(cat "$t/key5.pub")" \
+    --health-wait 5 --adopt-release "$t/web-v0.1.0.tgz" v0.1.0 --exec-start '/bin/sh app/run' >/dev/null 2>&1; then
+    fail "an unhealthy release adopted"
+fi
+[ ! -e /etc/systemd/system/badweb.service.d/ninja-deploy.conf ] || fail "drop-in left behind (release)"
+if [ -e /srv/badweb/current ] || [ -e /srv/badweb/releases/v0.1.0 ]; then fail "release adoption leftovers"; fi
+[ "$(systemctl show -p WorkingDirectory --value badweb)" = /opt/fakeweb ] || fail "WorkingDirectory not restored"
+[ "$(version_on 18083)" = 0.0.1 ] || fail "service not restored after a failed release adopt"
+ok "failed --adopt-release restores the old directory and command"
+
 package() { # <version> [broken]
     rm -rf "$t/pkg" && mkdir -p "$t/pkg/fakesvc"
     cp /usr/local/bin/fakesvc "$t/pkg/fakesvc/"

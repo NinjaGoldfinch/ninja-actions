@@ -15,7 +15,7 @@ moving tag: after a change, move it (`git tag -f v1 && git push -f origin v1`).
 | `infra/deploy.sh` | `ninja-deploy`, the forced command of each deploy key on the VPS and staging VM: `has`, `upload`, `activate` (restart, health check, automatic rollback), `list`. |
 | `infra/deploy.test.sh` | Tests `deploy.sh` against a fake service. |
 | `infra/deploy-host-setup.sh` | One-off setup of a deploy host: installs `ninja-deploy`, creates the `deploy` user, writes `/etc/ninja-deploy/env`. |
-| `infra/deploy-host-add.sh` | Lets one repository deploy one service to that host: `/srv` layout, settings, a sudo rule for its unit only, the forced-command key. Can move a running service into `/srv`. |
+| `infra/deploy-host-add.sh` | Lets one repository deploy one service to that host: `/srv` layout, settings, a sudo rule for its unit only, the forced-command key. Can move a running service (one binary, or a directory from a release tarball) into `/srv`. |
 | `infra/deploy-host.test.sh` | End-to-end test of the three over real SSH, sudo and systemd; CI runs it on a throwaway hosted runner. |
 | `tools/ngf-deploy` | Starts `deploy.yml` from your own machine with `gh`: the latest release (or `-v`) of one service or `all`, to `prod` (or `-e staging`). `-l` lists the latest releases. |
 | `tools/ngf-host` | On a host: `ngf-host status` compares what runs with the latest release or commit; `ngf-host update` updates projects CI does not deploy yet (git checkouts, `gh:` release binaries). Config in `~/.config/ngf-host/projects.conf`. |
@@ -104,6 +104,26 @@ sudo ./infra/deploy-host-add.sh ninja-monitor --unit ninja-monitor.service \
     --health-url http://127.0.0.1:9090/healthz --key 'ssh-ed25519 AAAA... ci-ninja-monitor-prod' \
     --adopt /usr/local/bin/ninja-monitor v0.2.1 \
     --exec-args '--config /etc/ninja-monitor/config.toml'
+```
+
+A service that runs from a directory rather than one binary (a Node server
+started as `node build` in a checkout, say) is moved over with
+`--adopt-release <release .tar.gz> <its version> --exec-start '<command>'`.
+The tarball is the release asset CI would upload, unpacked the same way as the
+first release; its `version.json` must name the version given. The drop-in
+sets `WorkingDirectory=/srv/<service>/current` and `ExecStart=<command>`, so
+the command's arguments are relative to whichever release is live, and the
+unit's other settings (user, environment file, sandboxing) stay as they are.
+A failed health check removes the drop-in, which puts back the old directory
+and command. Download the release and check it first:
+
+```sh
+gh release download v1.0.0 -R NinjaGoldfinch/ninjagoldfinch-lol -D /tmp/site-v1.0.0
+(cd /tmp/site-v1.0.0 && sha256sum -c SHA256SUMS)
+sudo ./infra/deploy-host-add.sh ninjagoldfinch-lol --unit ninjagoldfinch-lol.service \
+    --health-url http://127.0.0.1:3000/healthz --key 'ssh-ed25519 AAAA... ci-ninjagoldfinch-lol-prod' \
+    --adopt-release /tmp/site-v1.0.0/ninjagoldfinch-lol.tar.gz v1.0.0 \
+    --exec-start '/usr/bin/node build'
 ```
 
 A service whose boot can take long (a database migration, a large cache to
