@@ -1,6 +1,6 @@
 #!/bin/sh
 # ninja-deploy: the only command a CI deploy key can run on a deploy host
-# (the VPS or the staging VM). Install as /usr/local/sbin/ninja-deploy and
+# (the production or staging host). Install as /usr/local/sbin/ninja-deploy and
 # force it from the deploy user's authorized_keys, one key per service:
 #
 #   command="/usr/local/sbin/ninja-deploy ninja-monitor",restrict ssh-ed25519 AAAA... ci-ninja-monitor
