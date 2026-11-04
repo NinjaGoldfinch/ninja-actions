@@ -111,12 +111,19 @@ jobs:
     with:
       env: staging
       version: ${{ github.ref_name }}
+    # Without this the called job gets the environment's variables but an
+    # empty DEPLOY_SSH_KEY, and the SSH upload is refused.
+    secrets: inherit
     permissions:
       contents: read
 ```
 
-The called job reads the `staging` environment's own secrets and variables,
-so nothing is passed down. A failed staging deploy rolls back on the host and
+The called job reads the `staging` environment's variables by itself, but
+its secrets only with `secrets: inherit` on the calling job: without it
+`DEPLOY_SSH_KEY` is empty, ssh says `Load key ... error in libcrypto` and
+`Permission denied (publickey)`, while a `workflow_dispatch` of the same
+`deploy.yml` works (ninjagoldfinch-lol v1.0.3, runs 41916249133 and
+41916835187). A failed staging deploy rolls back on the host and
 fails the release run, which is the signal not to deploy that version to
 production.
 
