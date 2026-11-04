@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ngf-host — what's running on this box, and updates for projects CI doesn't deploy yet.
+# ngf-host — what's running on this box, and updates or deploys from the box itself.
 #
 # Usage:
 #   ngf-host                          # same as: ngf-host status
@@ -7,12 +7,21 @@
 #   ngf-host update [project...]      # update projects with new commits/releases
 #   ngf-host update --force [...]     # rebuild/restart even if nothing changed
 #   ngf-host update --dry-run [...]   # show what would happen
+#   ngf-host update <project> --version v1.2.3   # deploy: projects only, e.g. to roll back
+#   ngf-host self-update [ref]        # replace this script with tools/ngf-host at ref (default v1)
 #
 # Config: ~/.config/ngf-host/projects.conf, one line per project.
 #
-# Deployed by CI (status only; deploy with ngf-deploy from your machine):
-#   name|deploy:owner/repo|asset-name|service
+# Deployed through ninja-deploy (the same /srv releases, health check and
+# automatic rollback CI uses; `checksums` defaults to SHA256SUMS):
+#   name|deploy:owner/repo|asset-name|service|checksums
 #   ninja-monitor|deploy:NinjaGoldfinch/ninja-monitor|ninja-monitor-x86_64-linux.tar.gz|ninja-monitor
+#   ninja-lol|deploy:NinjaGoldfinch/ninjagoldfinch-lol|ninjagoldfinch-lol.tar.gz|ninjagoldfinch-lol
+#   riot-proxy|deploy:NinjaGoldfinch/riot-proxy|riot-proxy-x86_64-linux.tar.gz|riot-proxy|sha256sums
+# `update` downloads the release, checks it, and runs
+# `sudo -u deploy ninja-deploy <service>` (has, upload, activate) on this box.
+# That skips the GitHub prod approval and the Actions history; from your own
+# machine, ngf-deploy <service> deploys through CI instead.
 #
 # Git-checkout projects (pull, build in place, restart):
 #   name|path|branch|systemd-unit|build-command|user
@@ -36,27 +45,42 @@ TOKEN_FILE="${NGF_HOST_TOKEN:-$HOME/.config/ngf-host/github-token}"
 LOG_DIR="${NGF_HOST_LOG:-$HOME/.local/state/ngf-host}"
 TMP_DIR="/tmp/ngf-host"
 LOCK="/tmp/ngf-host.lock"
+NINJA_DEPLOY="${NGF_HOST_NINJA_DEPLOY:-/usr/local/sbin/ninja-deploy}"
+DEPLOY_USER="${NGF_HOST_DEPLOY_USER:-deploy}"
+ETC="${NGF_HOST_ETC:-/etc/ninja-deploy}"
+SRV="${NGF_HOST_SRV:-/srv}"
+SELF_REPO="${NGF_HOST_SELF_REPO:-NinjaGoldfinch/ninja-actions}"
 
+usage() { sed -n '2,/^$/p' "$0"; }
 cmd=status
 case "${1:-}" in
-  status|update) cmd=$1; shift ;;
-  -h|--help|help) sed -n '2,30p' "$0"; exit 0 ;;
+  status|update|self-update) cmd=$1; shift ;;
+  -h|--help|help) usage; exit 0 ;;
 esac
-force=0 dry=0; only=()
-for a in "$@"; do
-  case "$a" in
+force=0 dry=0 want_version=''; only=()
+while (( $# )); do
+  case "$1" in
     --force)   force=1 ;;
     --dry-run) dry=1 ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
-    -*)        echo "unknown option $a (try --help)" >&2; exit 2 ;;
-    *)         only+=("$a") ;;
+    --version)
+      (( $# >= 2 )) || { echo "--version takes a release tag such as v1.2.3" >&2; exit 2; }
+      shift; want_version=$1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*)        echo "unknown option $1 (try --help)" >&2; exit 2 ;;
+    *)         only+=("$1") ;;
   esac
+  shift
 done
-if [[ $cmd == status ]] && (( force || dry )); then
-  echo "--force and --dry-run belong to: ngf-host update" >&2; exit 2
+if [[ $cmd != update ]] && { (( force || dry )) || [[ -n $want_version ]]; }; then
+  echo "--force, --dry-run and --version belong to: ngf-host update" >&2; exit 2
+fi
+if [[ -n $want_version ]]; then
+  [[ $want_version =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
+    || { echo "--version takes a release tag such as v1.2.3" >&2; exit 2; }
+  (( ${#only[@]} == 1 )) || { echo "--version needs exactly one project" >&2; exit 2; }
 fi
 
-[[ -f "$CONF" ]] || { echo "no config at $CONF" >&2; exit 1; }
+[[ $cmd == self-update || -f "$CONF" ]] || { echo "no config at $CONF" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq is required (sudo apt install -y jq)" >&2; exit 1; }
 mkdir -p "$LOG_DIR" "$TMP_DIR"
 
@@ -76,6 +100,42 @@ gh_api() {
   curl -fsSL "${hdr[@]}" "$url"
 }
 
+# --- self-update -------------------------------------------------------------------
+# git's blob hash of a file, which the contents API reports as .sha
+blob_sha() { { printf 'blob %d\0' "$(( $(wc -c <"$1") ))"; cat "$1"; } | sha1sum | awk '{print $1}'; }
+
+# Fetch tools/ngf-host at a ref through the contents API, check it against git's
+# hash and a syntax check, then swap it in with mv (the running bash keeps the
+# old file open, so replacing it mid-run is safe).
+self_update() {
+  local ref=${1:-v1} self json want tmp commit
+  [[ $ref =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref '$ref'" >&2; return 2; }
+  self=$(readlink -f "$0")
+  json=$(gh_api "https://api.github.com/repos/$SELF_REPO/contents/tools/ngf-host?ref=$ref") \
+    || { echo "could not fetch tools/ngf-host at $ref from $SELF_REPO" >&2; return 1; }
+  want=$(jq -r '.sha // empty' <<<"$json")
+  [[ -n $want ]] || { echo "unexpected answer from the GitHub API" >&2; return 1; }
+  commit=$(gh_api "https://api.github.com/repos/$SELF_REPO/commits/$ref" 2>/dev/null | jq -r '.sha[0:7] // "?"') || commit='?'
+  if [[ $(blob_sha "$self") == "$want" ]]; then
+    echo "ngf-host is already the $ref version ($commit)"; return 0
+  fi
+  tmp=$(mktemp "$(dirname "$self")/.ngf-host.XXXXXX")
+  # shellcheck disable=SC2064 # expand $tmp now
+  trap "rm -f '$tmp'" EXIT
+  jq -r .content <<<"$json" | base64 -d >"$tmp"
+  [[ $(blob_sha "$tmp") == "$want" ]] || { echo "download does not match git's hash, not installing" >&2; return 1; }
+  bash -n "$tmp" || { echo "the $ref version does not parse, not installing" >&2; return 1; }
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$self"
+  trap - EXIT
+  echo "updated $self to $ref ($commit)"
+}
+
+if [[ $cmd == self-update ]]; then
+  (( ${#only[@]} <= 1 )) || { echo "self-update takes one ref" >&2; exit 2; }
+  self_update "${only[0]:-}"; exit
+fi
+
 # --- status (read-only) ------------------------------------------------------
 show() { printf '%-16s %-12s %-12s %s\n' "$@"; }
 latest_tag() { gh_api "https://api.github.com/repos/$1/releases/latest" 2>/dev/null | jq -r '.tag_name // "?"' || echo '?'; }
@@ -85,15 +145,15 @@ latest_tag() { gh_api "https://api.github.com/repos/$1/releases/latest" 2>/dev/n
 status_deploy() {
   local name=$1 repo=${2#deploy:} service=${4:-$1} latest live running state
   latest=$(latest_tag "$repo")
-  live=$(jq -r '.version // "?"' "/srv/$service/live.json" 2>/dev/null || echo none)
+  live=$(jq -r '.version // "?"' "$SRV/$service/live.json" 2>/dev/null || echo none)
   # shellcheck disable=SC1090 # the service's ninja-deploy settings, for HEALTH_URL
-  running=$( (. "/etc/ninja-deploy/$service.conf" && curl -fsS --max-time 2 "$HEALTH_URL") 2>/dev/null \
+  running=$( (. "$ETC/$service.conf" && curl -fsS --max-time 2 "$HEALTH_URL") 2>/dev/null \
              | jq -r '.version // empty' 2>/dev/null || true)
   running=${running:+v${running#v}}
   if [[ -z "$running" ]]; then state="NOT ANSWERING its health check"
   elif [[ "$running" != "$live" ]]; then state="running $running, but the last deploy was $live"
   elif [[ "$live" == "$latest" ]]; then state="up to date"
-  else state="behind: ngf-deploy $service"
+  else state="behind: ngf-host update $name"
   fi
   show "$name" "${running:-down}" "$latest" "$state"
 }
@@ -179,6 +239,84 @@ update_git() {
     fi
   fi
   restart_unit "$name" "$unit"
+}
+
+# --- update: projects deployed through ninja-deploy ------------------------------
+# ninja-deploy reads its command from SSH_ORIGINAL_COMMAND, as under CI's forced key.
+ninja_deploy() {
+  local service=$1; shift
+  sudo -u "$DEPLOY_USER" env SSH_ORIGINAL_COMMAND="$*" "$NINJA_DEPLOY" "$service"
+}
+
+update_deploy() {
+  local name=$1 repo=${2#deploy:} asset=$3 service=${4:-$1} sums=${5:-SHA256SUMS}
+  if [[ ! -r "$ETC/$service.conf" || ! -x "$NINJA_DEPLOY" ]]; then
+    say "$name" "$service is not set up for ninja-deploy here (infra/deploy-host-add.sh)"; return 1
+  fi
+  local json tag live
+  if [[ -n $want_version ]]; then
+    json=$(gh_api "https://api.github.com/repos/$repo/releases/tags/$want_version") \
+      || { say "$name" "no release $want_version in $repo"; return 1; }
+  else
+    json=$(gh_api "https://api.github.com/repos/$repo/releases/latest") \
+      || { say "$name" "could not fetch the latest release of $repo"; return 1; }
+  fi
+  tag=$(jq -r .tag_name <<<"$json")
+  live=$(jq -r '.version // "none"' "$SRV/$service/live.json" 2>/dev/null || echo none)
+  if [[ "$live" == "$tag" && $force -eq 0 ]]; then
+    say "$name" "up to date ($tag)"; return 3
+  fi
+
+  say "$name" "deploying $tag (live: $live) through ninja-deploy"
+  # What `ninja-deploy has` checks, read directly: the directories are
+  # world-readable, so this needs no sudo (a dry run never asks for a password),
+  # and a sudo or setup problem is reported as itself at upload, not taken for
+  # "not on disk".
+  if [[ ! -d "$SRV/$service/releases" ]]; then
+    say "$name" "$SRV/$service/releases does not exist (infra/deploy-host-add.sh)"; return 1
+  fi
+  (( dry )) || sudo -v || { say "$name" "sudo failed"; return 1; }
+  if [[ -d "$SRV/$service/releases/$tag" ]]; then
+    say "$name" "$tag is already on disk, skipping the upload"
+  elif (( dry )); then
+    echo "    would download $asset and $sums from $tag, check them, and run: ninja-deploy $service upload $tag"
+  else
+    local url sums_url dir
+    url=$(jq -r --arg a "$asset" '.assets[] | select(.name==$a) | .url' <<<"$json")
+    sums_url=$(jq -r --arg a "$sums" '.assets[] | select(.name==$a) | .url' <<<"$json")
+    if [[ -z "$url" || -z "$sums_url" ]]; then
+      say "$name" "release $tag lacks $asset or $sums. Assets: $(jq -r '[.assets[].name]|join(", ")' <<<"$json")"
+      return 1
+    fi
+    dir=$(mktemp -d "$TMP_DIR/$name.XXXXXX")
+    # Runs in its own subshell (see main), so EXIT is the end of this project.
+    # shellcheck disable=SC2064 # expand $dir now
+    trap "rm -rf '$dir'" EXIT
+    if ! gh_download "$url" "$dir/$asset" || ! gh_download "$sums_url" "$dir/$sums"; then
+      say "$name" "download failed"; return 1
+    fi
+    if ! (cd "$dir" && sha256sum --ignore-missing --strict --quiet -c "$sums"); then
+      say "$name" "CHECKSUM FAILED for $asset against $sums, not deploying"; return 1
+    fi
+    say "$name" "checksum ok, uploading"
+    ninja_deploy "$service" upload "$tag" <"$dir/$asset" | tee -a "$LOG_DIR/ngf-host.log" \
+      || { say "$name" "UPLOAD FAILED"; return 1; }
+  fi
+
+  if (( dry )); then
+    echo "    would run: ninja-deploy $service activate $tag"; return 0
+  fi
+  if ninja_deploy "$service" activate "$tag" 2>&1 | tee -a "$LOG_DIR/ngf-host.log"; then
+    say "$name" "ok, $tag is live"
+  else
+    say "$name" "DEPLOY FAILED (ninja-deploy rolls back by itself; see above)"; return 1
+  fi
+}
+
+gh_download() {
+  local -a hdr=(-H "Accept: application/octet-stream")
+  [[ -r "$TOKEN_FILE" ]] && hdr+=(-H "Authorization: Bearer $(<"$TOKEN_FILE")")
+  curl -fsSL "${hdr[@]}" -o "$2" "$1"
 }
 
 # --- update: GitHub release projects -------------------------------------------
@@ -282,12 +420,13 @@ while IFS='|' read -r name f2 f3 f4 f5 f6; do
   [[ -z "$name" || "$name" == \#* ]] && continue
   wanted "$name" || continue
 
-  if [[ "$f2" == deploy:* ]]; then
-    say "$name" "deployed by CI, not here (ngf-deploy $name from your machine)"
-    skipped+=("$name"); continue
+  if [[ -n $want_version && "$f2" != deploy:* ]]; then
+    say "$name" "--version works for deploy: projects only"; failed+=("$name"); continue
   fi
   rc=0
-  if [[ "$f2" == gh:* ]]; then
+  if [[ "$f2" == deploy:* ]]; then
+    ( update_deploy "$name" "$f2" "$f3" "$f4" "$f5" ) || rc=$?
+  elif [[ "$f2" == gh:* ]]; then
     ( update_release "$name" "$f2" "$f3" "$f4" "$f5" ) || rc=$?
   else
     ( update_git "$name" "$f2" "$f3" "$f4" "$f5" "$f6" ) || rc=$?
