@@ -8,6 +8,7 @@
 #   ngf-host update --force [...]     # rebuild/restart even if nothing changed
 #   ngf-host update --dry-run [...]   # show what would happen
 #   ngf-host update <project> --version v1.2.3   # deploy: projects only, e.g. to roll back
+#   ngf-host self-update [ref]        # replace this script with tools/ngf-host at ref (default v1)
 #
 # Config: ~/.config/ngf-host/projects.conf, one line per project.
 #
@@ -48,11 +49,12 @@ NINJA_DEPLOY="${NGF_HOST_NINJA_DEPLOY:-/usr/local/sbin/ninja-deploy}"
 DEPLOY_USER="${NGF_HOST_DEPLOY_USER:-deploy}"
 ETC="${NGF_HOST_ETC:-/etc/ninja-deploy}"
 SRV="${NGF_HOST_SRV:-/srv}"
+SELF_REPO="${NGF_HOST_SELF_REPO:-NinjaGoldfinch/ninja-actions}"
 
 usage() { sed -n '2,/^$/p' "$0"; }
 cmd=status
 case "${1:-}" in
-  status|update) cmd=$1; shift ;;
+  status|update|self-update) cmd=$1; shift ;;
   -h|--help|help) usage; exit 0 ;;
 esac
 force=0 dry=0 want_version=''; only=()
@@ -67,7 +69,7 @@ while (( $# )); do
   esac
   shift
 done
-if [[ $cmd == status ]] && (( force || dry )) || [[ $cmd == status && -n $want_version ]]; then
+if [[ $cmd != update ]] && { (( force || dry )) || [[ -n $want_version ]]; }; then
   echo "--force, --dry-run and --version belong to: ngf-host update" >&2; exit 2
 fi
 if [[ -n $want_version ]]; then
@@ -76,7 +78,7 @@ if [[ -n $want_version ]]; then
   (( ${#only[@]} == 1 )) || { echo "--version needs exactly one project" >&2; exit 2; }
 fi
 
-[[ -f "$CONF" ]] || { echo "no config at $CONF" >&2; exit 1; }
+[[ $cmd == self-update || -f "$CONF" ]] || { echo "no config at $CONF" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq is required (sudo apt install -y jq)" >&2; exit 1; }
 mkdir -p "$LOG_DIR" "$TMP_DIR"
 
@@ -95,6 +97,42 @@ gh_api() {
   [[ -r "$TOKEN_FILE" ]] && hdr+=(-H "Authorization: Bearer $(<"$TOKEN_FILE")")
   curl -fsSL "${hdr[@]}" "$url"
 }
+
+# --- self-update -------------------------------------------------------------------
+# git's blob hash of a file, which the contents API reports as .sha
+blob_sha() { { printf 'blob %d\0' "$(( $(wc -c <"$1") ))"; cat "$1"; } | sha1sum | awk '{print $1}'; }
+
+# Fetch tools/ngf-host at a ref through the contents API, check it against git's
+# hash and a syntax check, then swap it in with mv (the running bash keeps the
+# old file open, so replacing it mid-run is safe).
+self_update() {
+  local ref=${1:-v1} self json want tmp commit
+  [[ $ref =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref '$ref'" >&2; return 2; }
+  self=$(readlink -f "$0")
+  json=$(gh_api "https://api.github.com/repos/$SELF_REPO/contents/tools/ngf-host?ref=$ref") \
+    || { echo "could not fetch tools/ngf-host at $ref from $SELF_REPO" >&2; return 1; }
+  want=$(jq -r '.sha // empty' <<<"$json")
+  [[ -n $want ]] || { echo "unexpected answer from the GitHub API" >&2; return 1; }
+  commit=$(gh_api "https://api.github.com/repos/$SELF_REPO/commits/$ref" 2>/dev/null | jq -r '.sha[0:7] // "?"') || commit='?'
+  if [[ $(blob_sha "$self") == "$want" ]]; then
+    echo "ngf-host is already the $ref version ($commit)"; return 0
+  fi
+  tmp=$(mktemp "$(dirname "$self")/.ngf-host.XXXXXX")
+  # shellcheck disable=SC2064 # expand $tmp now
+  trap "rm -f '$tmp'" EXIT
+  jq -r .content <<<"$json" | base64 -d >"$tmp"
+  [[ $(blob_sha "$tmp") == "$want" ]] || { echo "download does not match git's hash, not installing" >&2; return 1; }
+  bash -n "$tmp" || { echo "the $ref version does not parse, not installing" >&2; return 1; }
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$self"
+  trap - EXIT
+  echo "updated $self to $ref ($commit)"
+}
+
+if [[ $cmd == self-update ]]; then
+  (( ${#only[@]} <= 1 )) || { echo "self-update takes one ref" >&2; exit 2; }
+  self_update "${only[0]:-}"; exit
+fi
 
 # --- status (read-only) ------------------------------------------------------
 show() { printf '%-16s %-12s %-12s %s\n' "$@"; }
