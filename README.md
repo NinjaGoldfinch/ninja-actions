@@ -120,6 +120,42 @@ so nothing is passed down. A failed staging deploy rolls back on the host and
 fails the release run, which is the signal not to deploy that version to
 production.
 
+### Nothing reaches production without passing staging
+
+Two commit statuses on the release tag's commit record what a version has
+passed, with the same names in every repository:
+
+| Status | Set by | Meaning |
+|---|---|---|
+| `staging/smoke` | the repository's `deploy.yml`, after its own smoke test of staging | this version works on staging |
+| `prod/deployed` | the deploy action's `set-status`, after a production deploy | this version has been live in production (so rolling back to it is allowed) |
+
+A production deploy passes `require-status: staging/smoke prod/deployed` to
+the deploy action, which refuses a version with neither at success before
+anything is downloaded. In an emergency, `unverified-reason: <why>` skips the
+check; the reason is written to the log and the job summary as a warning.
+The job needs `statuses: write` for `set-status`:
+
+```yaml
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - uses: NinjaGoldfinch/ninja-actions/deploy@v1
+        with:
+          # ... service, version, asset, host, keys as before ...
+          require-status: ${{ inputs.env == 'prod' && 'staging/smoke prod/deployed' || '' }}
+          set-status: ${{ inputs.env == 'prod' && 'prod/deployed' || '' }}
+          unverified-reason: ${{ inputs.break_glass }}
+```
+
+A repository that does not set statuses yet leaves `require-status` empty
+and deploys as before. To see what a version has passed:
+
+```sh
+gh api repos/NinjaGoldfinch/<repo>/commits/<tag>/status --jq '.statuses[] | "\(.context) \(.state)"'
+```
+
 ### Setting up a host
 
 On your own machine, make a key pair for the repository and store the private

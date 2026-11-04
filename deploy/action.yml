@@ -6,6 +6,8 @@ description: >
   then activate it. Activation health-checks the service and rolls back on
   failure, which fails this step. Rolling back on purpose is deploying an
   older version that is still on disk: it skips the upload.
+  Optionally it refuses a version whose commit lacks a passing status (for
+  example staging/smoke before prod), and marks the commit once deployed.
 
 inputs:
   service:
@@ -33,8 +35,24 @@ inputs:
     description: Private key whose public half is forced to `ninja-deploy <service>` on the host.
     required: true
   token:
-    description: Token for downloading the release.
+    description: Token for downloading the release, reading commit statuses and setting set-status.
     default: ${{ github.token }}
+  require-status:
+    description: >
+      Space-separated commit status contexts, e.g. "staging/smoke prod/deployed".
+      If set, the deploy is refused before anything is downloaded unless the
+      commit the version's tag points to has at least one of them at success.
+    default: ''
+  unverified-reason:
+    description: >
+      Break glass: deploy without the require-status check. The reason is
+      written to the log and the job summary as a warning. Empty means no.
+    default: ''
+  set-status:
+    description: >
+      A commit status context, e.g. prod/deployed, set to success on the
+      version's commit after a successful deploy. Needs `statuses: write`.
+    default: ''
 
 outputs:
   result:
@@ -56,6 +74,9 @@ runs:
         KNOWN_HOSTS: ${{ inputs.known-hosts }}
         SSH_KEY: ${{ inputs.ssh-key }}
         GH_TOKEN: ${{ inputs.token }}
+        REQUIRE_STATUS: ${{ inputs.require-status }}
+        UNVERIFIED_REASON: ${{ inputs.unverified-reason }}
+        SET_STATUS: ${{ inputs.set-status }}
       run: |
         # GitHub runs this with bash -e; every status below is handled by hand, and
         # under -e a remote `has` answering 1 (not on disk) ended the step silently.
@@ -70,8 +91,39 @@ runs:
             "$DEPLOY_USER@$HOST" "$@"
         }
         started=$(date +%s)
+        repo=$GITHUB_REPOSITORY
+
+        # The commit a release tag points to, and whether it carries a passing status.
+        commit=
+        gate() {
+          [ -n "$REQUIRE_STATUS" ] || return 0
+          if [ -n "$UNVERIFIED_REASON" ]; then
+            echo "::warning::UNVERIFIED deploy of $SERVICE $VERSION (skipping $REQUIRE_STATUS): $UNVERIFIED_REASON"
+            return 0
+          fi
+          commit=$(gh api "repos/$repo/commits/$VERSION" --jq .sha) || { echo "::error::cannot find the commit of $VERSION"; return 1; }
+          for ctx in $REQUIRE_STATUS; do
+            state=$(gh api "repos/$repo/commits/$commit/status" \
+              --jq ".statuses[] | select(.context == \"$ctx\") | .state") || { echo "::error::cannot read the statuses of $commit"; return 1; }
+            if [ "$state" = success ]; then
+              echo "$VERSION ($commit) has $ctx=success"
+              return 0
+            fi
+          done
+          echo "::error::$VERSION ($commit) has none of: $REQUIRE_STATUS at success. Deploy it to staging first, or break glass with unverified-reason."
+          return 1
+        }
+
+        mark() {
+          [ -n "$SET_STATUS" ] || return 0
+          [ -n "$commit" ] || commit=$(gh api "repos/$repo/commits/$VERSION" --jq .sha) || return 1
+          gh api -X POST "repos/$repo/statuses/$commit" -f state=success -f context="$SET_STATUS" \
+            -f description="$SERVICE $VERSION live on $HOST" --jq .context >/dev/null \
+            && echo "set $SET_STATUS=success on $commit"
+        }
 
         deploy() {
+          gate || return 1
           rc=0
           remote has "$VERSION" || rc=$?
           case $rc in
@@ -85,7 +137,9 @@ runs:
             ;;
           *) echo "::error::cannot reach $DEPLOY_USER@$HOST"; return 1 ;;
           esac
-          remote activate "$VERSION"
+          remote activate "$VERSION" || return 1
+          # The release is live; failing to record that must not read as a failed deploy.
+          mark || echo "::warning::$SERVICE $VERSION is live, but setting $SET_STATUS failed"
         }
 
         deploy 2>&1 | tee "$log"
@@ -97,6 +151,11 @@ runs:
           echo "## Deploy $SERVICE $VERSION: $result"
           echo
           echo "Host \`$HOST\`, $(( $(date +%s) - started )) s."
+          if [ -n "$REQUIRE_STATUS" ] && [ -n "$UNVERIFIED_REASON" ]; then
+            echo
+            echo "> [!WARNING]"
+            echo "> **Unverified deploy**: skipped the \`$REQUIRE_STATUS\` check. Reason: $UNVERIFIED_REASON"
+          fi
           echo
           echo '```'
           tail -n 50 "$log"

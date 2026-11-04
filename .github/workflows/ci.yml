@@ -64,13 +64,37 @@ jobs:
           }
           pkg v0.1.0
           pkg v0.1.1 broken
-          cat > "$w/bin/gh" <<EOF
-          #!/bin/sh
-          [ "\$1 \$2" = "release download" ] || exit 2
-          tag=\$3; shift 3; dir=.
-          while [ \$# -gt 0 ]; do [ "\$1" = -D ] && { dir=\$2; shift; }; shift; done
-          cp "$w/rel/\$tag/"* "\$dir/"
+          pkg v0.1.2
+          pkg v0.1.3
+          # A stand-in gh: releases from disk, and commit statuses kept as files
+          # in $w/status/<sha>/<context with / as _>. A tag's commit is sha-<tag>.
+          cat > "$w/bin/gh" <<'EOF'
+          #!/bin/bash
+          w=__W__
+          if [ "$1 $2" = "release download" ]; then
+            tag=$3; shift 3; dir=.
+            while [ $# -gt 0 ]; do [ "$1" = -D ] && { dir=$2; shift; }; shift; done
+            exec cp "$w/rel/$tag/"* "$dir/"
+          fi
+          [ "$1" = api ] || exit 2
+          shift
+          if [ "$1 $2" = "-X POST" ]; then
+            sha=${3##*/} ctx=
+            for a in "$@"; do case $a in context=*) ctx=${a#context=} ;; esac; done
+            mkdir -p "$w/status/$sha" && echo success > "$w/status/$sha/${ctx//\//_}"
+            echo "$ctx"; exit 0
+          fi
+          case $1 in
+            */status)
+              sha=$(basename "$(dirname "$1")")
+              ctx=$(printf '%s' "$*" | sed -n 's/.*context == "\([^"]*\)".*/\1/p')
+              f=$w/status/$sha/${ctx//\//_}
+              [ -f "$f" ] && cat "$f"; exit 0 ;;
+            */commits/v*) echo "sha-${1##*/}" ;;
+            *) exit 2 ;;
+          esac
           EOF
+          sed -i "s|__W__|$w|" "$w/bin/gh"
           chmod +x "$w/bin/gh"
           echo "$w/bin" >> "$GITHUB_PATH"
           {
@@ -118,3 +142,73 @@ jobs:
           test "$RESULT" = failure
           curl -fsS http://127.0.0.1:18080/healthz | grep -q '"version":"0.1.0"'
           test "$(readlink /srv/fakesvc/current)" = /srv/fakesvc/releases/v0.1.0
+
+      # The gate: a version without a passing status is refused before anything
+      # is downloaded; break glass deploys it anyway and marks it prod/deployed.
+      - name: A version without a passing status is refused
+        id: gated
+        continue-on-error: true
+        uses: ./deploy
+        with:
+          service: fakesvc
+          version: v0.1.2
+          asset: fakesvc.tar.gz
+          host: 127.0.0.1
+          known-hosts: ${{ steps.prep.outputs.known_hosts }}
+          ssh-key: ${{ steps.prep.outputs.key }}
+          require-status: staging/smoke prod/deployed
+
+      - name: It was refused, and nothing reached the host
+        env:
+          OUTCOME: ${{ steps.gated.outcome }}
+        run: |
+          test "$OUTCOME" = failure
+          test ! -e /srv/fakesvc/releases/v0.1.2
+          test "$(readlink /srv/fakesvc/current)" = /srv/fakesvc/releases/v0.1.0
+
+      - name: Break glass deploys it, and set-status marks it
+        uses: ./deploy
+        with:
+          service: fakesvc
+          version: v0.1.2
+          asset: fakesvc.tar.gz
+          host: 127.0.0.1
+          known-hosts: ${{ steps.prep.outputs.known_hosts }}
+          ssh-key: ${{ steps.prep.outputs.key }}
+          require-status: staging/smoke prod/deployed
+          unverified-reason: CI test of the break-glass path
+          set-status: prod/deployed
+
+      - name: v0.1.2 is live and marked prod/deployed
+        run: |
+          curl -fsS http://127.0.0.1:18080/healthz | grep -q '"version":"0.1.2"'
+          test "$(cat "$RUNNER_TEMP/action-test/status/sha-v0.1.2/prod_deployed")" = success
+          # A version that passed staging goes through the gate.
+          mkdir -p "$RUNNER_TEMP/action-test/status/sha-v0.1.3"
+          echo success > "$RUNNER_TEMP/action-test/status/sha-v0.1.3/staging_smoke"
+
+      - name: A version with staging/smoke passes the gate
+        uses: ./deploy
+        with:
+          service: fakesvc
+          version: v0.1.3
+          asset: fakesvc.tar.gz
+          host: 127.0.0.1
+          known-hosts: ${{ steps.prep.outputs.known_hosts }}
+          ssh-key: ${{ steps.prep.outputs.key }}
+          require-status: staging/smoke prod/deployed
+          set-status: prod/deployed
+
+      - name: Rolling back to a version marked prod/deployed passes the gate
+        uses: ./deploy
+        with:
+          service: fakesvc
+          version: v0.1.2
+          asset: fakesvc.tar.gz
+          host: 127.0.0.1
+          known-hosts: ${{ steps.prep.outputs.known_hosts }}
+          ssh-key: ${{ steps.prep.outputs.key }}
+          require-status: staging/smoke prod/deployed
+
+      - name: Rolled back to v0.1.2
+        run: curl -fsS http://127.0.0.1:18080/healthz | grep -q '"version":"0.1.2"'
