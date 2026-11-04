@@ -62,7 +62,9 @@ while (( $# )); do
   case "$1" in
     --force)   force=1 ;;
     --dry-run) dry=1 ;;
-    --version) shift; want_version=${1:-} ;;
+    --version)
+      (( $# >= 2 )) || { echo "--version takes a release tag such as v1.2.3" >&2; exit 2; }
+      shift; want_version=$1 ;;
     -h|--help) usage; exit 0 ;;
     -*)        echo "unknown option $1 (try --help)" >&2; exit 2 ;;
     *)         only+=("$1") ;;
@@ -266,10 +268,15 @@ update_deploy() {
   fi
 
   say "$name" "deploying $tag (live: $live) through ninja-deploy"
+  # What `ninja-deploy has` checks, read directly: the directories are
+  # world-readable, so this needs no sudo (a dry run never asks for a password),
+  # and a sudo or setup problem is reported as itself at upload, not taken for
+  # "not on disk".
+  if [[ ! -d "$SRV/$service/releases" ]]; then
+    say "$name" "$SRV/$service/releases does not exist (infra/deploy-host-add.sh)"; return 1
+  fi
   (( dry )) || sudo -v || { say "$name" "sudo failed"; return 1; }
-  local rc=0
-  ninja_deploy "$service" has "$tag" || rc=$?
-  if (( rc == 0 )); then
+  if [[ -d "$SRV/$service/releases/$tag" ]]; then
     say "$name" "$tag is already on disk, skipping the upload"
   elif (( dry )); then
     echo "    would download $asset and $sums from $tag, check them, and run: ninja-deploy $service upload $tag"
