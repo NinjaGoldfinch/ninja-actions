@@ -73,8 +73,9 @@ while (( $# )); do
       (( $# >= 2 )) || { echo "--version takes a release tag such as v1.2.3" >&2; exit 2; }
       shift; want_version=$1 ;;
     --unverified)
-      (( $# >= 2 )) && [[ -n $2 && $2 != -* ]] \
-        || { echo "--unverified takes a reason, e.g. --unverified 'hotfix for outage, staging down'" >&2; exit 2; }
+      if (( $# < 2 )) || [[ -z $2 || $2 == -* ]]; then
+        echo "--unverified takes a reason, e.g. --unverified 'hotfix for outage, staging down'" >&2; exit 2
+      fi
       shift; unverified=$1 ;;
     -h|--help) usage; exit 0 ;;
     -*)        echo "unknown option $1 (try --help)" >&2; exit 2 ;;
