@@ -1,5 +1,5 @@
 #!/bin/sh
-# One-off setup of a deploy host (the VPS, later the staging VM). Run as root
+# One-off setup of a deploy host (the production or staging host). Run as root
 # from a checkout of this repository. Safe to run again.
 #
 #   sudo ./infra/deploy-host-setup.sh --env prod      (or --env staging)

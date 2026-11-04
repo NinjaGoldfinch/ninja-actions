@@ -12,7 +12,7 @@ moving tag: after a change, move it (`git tag -f v1 && git push -f origin v1`).
 |---|---|
 | `test-report/` | Composite action. Checks a test run left `reports/junit.xml` and `reports/coverage.xml` (Cobertura), writes a summary to the job page, uploads both as the `test-reports` artifact. |
 | `deploy/` | Composite action. Downloads a release asset, checks its sha256, uploads it to a deploy host unless already there, and activates it through `ninja-deploy`. Writes the deploy log to the job summary. |
-| `infra/deploy.sh` | `ninja-deploy`, the forced command of each deploy key on the VPS and staging VM: `has`, `upload`, `activate` (restart, health check, automatic rollback), `list`. |
+| `infra/deploy.sh` | `ninja-deploy`, the forced command of each deploy key on the production and staging hosts: `has`, `upload`, `activate` (restart, health check, automatic rollback), `list`. |
 | `infra/deploy.test.sh` | Tests `deploy.sh` against a fake service. |
 | `infra/deploy-host-setup.sh` | One-off setup of a deploy host: installs `ninja-deploy`, creates the `deploy` user, writes `/etc/ninja-deploy/env`. |
 | `infra/deploy-host-add.sh` | Lets one repository deploy one service to that host: `/srv` layout, settings, a sudo rule for its unit only, the forced-command key. Can move a running service (one binary, or a directory from a release tarball) into `/srv`. |
@@ -34,7 +34,7 @@ The CI dashboard ingests exactly these two files.
 
 ## Deploys
 
-A host (the VPS, later the staging VM) has a `deploy` user whose
+A host (production `ngf-prod-syd1`, staging `ngf-mon-syd1`) has a `deploy` user whose
 `authorized_keys` holds one key per service, each forced to
 `ninja-deploy <service>`, so a repository's key can only deploy that
 repository's service, and only through the commands above. Releases live in
@@ -53,6 +53,72 @@ ngf-deploy ninja-monitor            # latest release to prod; approve it in the 
 ngf-deploy ninja-monitor -v v0.2.1  # a specific version, e.g. to roll back
 ngf-deploy -l                       # latest release of each repository
 ```
+
+### Staging
+
+Staging is the OVH VPS `ngf-mon-syd1` (Sydney, Ubuntu, `ENV=staging` in
+`/etc/ninja-deploy/env`). It is set up like production: the same
+`ninja-deploy`, `deploy` user and `/srv` layout, one key per service. Its
+public hostnames are served by its own Cloudflare tunnel, `ngf-staging`
+(never a connector of the production or home tunnels), and both hostnames
+are behind one Access application (`staging`) that only the owner can log in
+to. Deploys still come in over SSH, not through the tunnel:
+
+| Hostname | On the host |
+|---|---|
+| `staging.ninjagoldfinch.lol` | the site, `127.0.0.1:3000` |
+| `riot-proxy-staging.ninjagoldfinch.com` | riot-proxy, `127.0.0.1:8080` |
+
+Each repository has a `staging` environment next to `prod`: no required
+reviewer, deployment branches `main` plus the tag pattern `v*` (a deploy
+started by a release runs on its tag), and its own `DEPLOY_SSH_KEY`,
+`DEPLOY_HOST` and `DEPLOY_KNOWN_HOSTS`.
+
+Every release goes to staging by itself; production still waits for an
+approval. A release created by a workflow's `GITHUB_TOKEN` starts no other
+workflow, so `on: release` in `deploy.yml` would never fire. Instead
+`deploy.yml` can also be called, and `release.yml` calls it once the release
+is published:
+
+```yaml
+# deploy.yml
+on:
+  workflow_dispatch:
+    inputs:
+      env: { type: choice, options: [staging, prod], default: staging }
+      version: { required: true }
+  workflow_call:
+    inputs:
+      env: { type: string, required: true }
+      version: { type: string, required: true }
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, proxmox]
+    environment: ${{ inputs.env }}
+    # On the job, not the workflow, so it also holds when called.
+    concurrency: { group: deploy-${{ inputs.env }}, cancel-in-progress: false }
+    steps:
+      - uses: NinjaGoldfinch/ninja-actions/deploy@v1
+        with: { ... as for prod ... }
+```
+
+```yaml
+# release.yml, after the job that publishes the release
+  staging:
+    needs: publish
+    uses: ./.github/workflows/deploy.yml
+    with:
+      env: staging
+      version: ${{ github.ref_name }}
+    permissions:
+      contents: read
+```
+
+The called job reads the `staging` environment's own secrets and variables,
+so nothing is passed down. A failed staging deploy rolls back on the host and
+fails the release run, which is the signal not to deploy that version to
+production.
 
 ### Setting up a host
 
