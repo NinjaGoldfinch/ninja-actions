@@ -137,7 +137,7 @@ scan() {
             success | inactive | failure | error)
                 [ -z "$live" ] || continue ;;
             queued | waiting | pending | in_progress)
-                [ -n "$3" ] && [ -z "$pend" ] || continue ;;
+                if [ -z "$3" ] || [ -n "$pend" ]; then continue; fi ;;
             *) continue ;;
         esac
         info=$(job_info "$1" "$job")
