@@ -20,10 +20,13 @@ jobs:
           persist-credentials: false
 
       - name: Shellcheck
-        run: shellcheck infra/*.sh tools/ngf-deploy tools/ngf-host tools/ngf-tunnel
+        run: shellcheck infra/*.sh tools/ngf-deploy tools/ngf-deploy.test.sh tools/ngf-host tools/ngf-tunnel
 
       - name: deploy.sh
         run: sh infra/deploy.test.sh
+
+      - name: ngf-deploy
+        run: sh tools/ngf-deploy.test.sh
 
   deploy-host:
     name: Deploy host (end to end)

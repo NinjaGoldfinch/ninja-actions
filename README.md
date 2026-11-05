@@ -17,7 +17,8 @@ moving tag: after a change, move it (`git tag -f v1 && git push -f origin v1`).
 | `infra/deploy-host-setup.sh` | One-off setup of a deploy host: installs `ninja-deploy`, creates the `deploy` user, writes `/etc/ninja-deploy/env`. |
 | `infra/deploy-host-add.sh` | Lets one repository deploy one service to that host: `/srv` layout, settings, a sudo rule for its unit only, the forced-command key. Can move a running service (one binary, or a directory from a release tarball) into `/srv`. |
 | `infra/deploy-host.test.sh` | End-to-end test of the three over real SSH, sudo and systemd; CI runs it on a throwaway hosted runner. |
-| `tools/ngf-deploy` | Starts `deploy.yml` from your own machine with `gh`: the latest release (or `-v`) of one service or `all`, to `prod` (or `-e staging`). `-l` lists the latest releases. |
+| `tools/ngf-deploy` | Starts `deploy.yml` from your own machine with `gh`: the latest release (or `-v`) of one service or `all`, to `prod` (or `-e staging`). Prints the version, its commit statuses and what is live first; does nothing if that version is already live or being deployed (`-f` forces), and refuses a prod deploy that would fail the staging gate before you are asked to approve it (`-b '<reason>'` breaks glass). `-w` waits and shows the failed log, `-d` prints every `gh` call, `-l` lists what is live where. |
+| `tools/ngf-deploy.test.sh` | Tests `ngf-deploy` against a fake `gh`. |
 | `tools/ngf-host` | On a host: `ngf-host status` compares what runs with the latest release or commit; `ngf-host update` deploys `deploy:` services through `ninja-deploy` on the box (latest release, or `--version` to roll back; no GitHub approval, but on a prod host only a version with `staging/smoke` or `prod/deployed`, unless `--unverified '<reason>'`) and updates git checkouts and `gh:` release binaries. `ngf-host self-update` replaces it with the `v1` version (or a ref you name), checked against git's hash. Config in `~/.config/ngf-host/projects.conf`. |
 | `tools/ngf-tunnel` | On your own machine: runs the `*-tunnels` entries of `~/.ssh/config` in the background (`ngf-tunnel up`, `status`, `down`). |
 | `infra/runner-setup.sh` | One-off setup of the self-hosted runner VM on Proxmox (run as root inside it). |
@@ -49,10 +50,30 @@ From your own machine (needs `gh`, logged in):
 ```sh
 curl -fsSL -o ~/bin/ngf-deploy https://raw.githubusercontent.com/NinjaGoldfinch/ninja-actions/main/tools/ngf-deploy
 chmod +x ~/bin/ngf-deploy
-ngf-deploy ninja-monitor            # latest release to prod; approve it in the run
-ngf-deploy ninja-monitor -v v0.2.1  # a specific version, e.g. to roll back
-ngf-deploy -l                       # latest release of each repository
+ngf-deploy ninja-monitor -w            # latest release to prod; approve it in the run
+ngf-deploy ninja-monitor -v v0.2.1     # a specific version, e.g. to roll back
+ngf-deploy ninja-monitor -e staging    # to staging instead
+ngf-deploy -l                          # latest release, and what is live on prod and staging
 ```
+
+Before starting a run it prints what it found, for example:
+
+```text
+ninja-monitor v0.2.3 -> prod
+  version   v0.2.3 (latest release), commit cef2dea
+  statuses  staging/smoke success, prod/deployed success
+  live      v0.2.3 on prod (https://github.com/NinjaGoldfinch/ninja-monitor/actions/runs/41944966575)
+  already live on prod; nothing to do (-f deploys it again)
+```
+
+It starts nothing when that version is already live on the environment, or a
+deploy of it is still queued, running or waiting for approval; `-f` deploys
+anyway. "Live" is the newest GitHub deployment to that environment whose
+deploy step succeeded, so a deploy made on the host with `ngf-host` is not
+seen. A prod deploy of a version with neither `staging/smoke` nor
+`prod/deployed` is refused on your machine, before an approval is asked for;
+`-b '<reason>'` passes the reason as `break_glass` and skips the check. `-d`
+prints every `gh` call and each deployment it looked at.
 
 ### Staging
 
