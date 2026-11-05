@@ -12,6 +12,7 @@ mkdir "$t/bin"
 
 # The fake gh. Its answers are already what the real gh prints after -q.
 # FAKE_STATUSES: the tag's commit statuses ("staging/smoke=success ...").
+# $t/jobs records each job looked up, to check how many lookups were needed.
 # $t/deploys: "<env> <deployment id> <state> <run> <job> <version> <deployed>".
 cat > "$t/bin/gh" <<'EOF'
 #!/bin/sh
@@ -26,17 +27,19 @@ case "$1 $2" in
 esac
 [ "$1" = api ] || { echo "fake gh: unexpected $*" >&2; exit 1; }
 case $2 in
-*/contents/*) exit 0 ;;
-*/commits/*/status) echo "$FAKE_STATUSES" ;;
-*/commits/*) echo 0123456789abcdef ;;
-*/deployments\?environment=*)
-    env=${2#*environment=}; env=${env%%&*}
-    awk -v e="$env" '$1 == e { print $2 }' "$t/deploys" ;;
-*/deployments/*/statuses*)
-    id=${2#*/deployments/}; id=${id%%/*}
-    awk -v i="$id" '$2 == i { print $3, "https://github.com/o/r/actions/runs/" $4 "/job/" $5 }' "$t/deploys" ;;
+graphql)
+    # What ngf-deploy's -q turns the answer into: facts, then deployments.
+    # A tag given with -v exists unless it is FAKE_MISSING_TAG.
+    tag=''
+    for a in "$@"; do case $a in tag=refs/tags/*) tag=${a#tag=refs/tags/} ;; esac; done
+    echo "deploy_yml=true"
+    echo "latest=$FAKE_LATEST"
+    if [ "$tag" = "${FAKE_MISSING_TAG:-}" ]; then echo "sha="; else echo "sha=0123456789abcdef"; fi
+    echo "statuses=$FAKE_STATUSES"
+    awk '{ print "dep", $1, $2, $3, $4, $5 }' "$t/deploys" ;;
 */actions/jobs/*)
     job=${2##*/}
+    echo "$job" >> "$t/jobs"
     awk -v j="$job" '$5 == j { print $6, $7 }' "$t/deploys" ;;
 *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
 esac
@@ -52,6 +55,7 @@ run() {
     want=$1
     shift
     : > "$t/started"
+    : > "$t/jobs"
     echo 1 > "$t/runs"
     rc=0
     ${NGF_SH:-sh} "$here/ngf-deploy" ninja-monitor "$@" > "$t/out" 2>&1 || rc=$?
@@ -136,7 +140,30 @@ says 'refused by the fake'
 
 echo '-d prints the gh commands'
 run 0 -d
-says '\[debug\] gh api repos/NinjaGoldfinch/ninja-monitor/deployments?environment=prod'
+says '\[debug\] gh api graphql -F owner=NinjaGoldfinch -F repo=ninja-monitor'
+
+echo '-v with a tag that does not exist: refused, not the latest release'
+FAKE_MISSING_TAG=v9.9.9 run 1 -v v9.9.9
+says 'ninja-monitor has no tag v9.9.9'
+started && fail "started a deploy of a missing tag"
+
+echo 'only the jobs needed are looked up: the newest prod deployment is live'
+cat > "$t/deploys" <<'EOF2'
+prod 90 success 900 9000 v1.1.0 true
+prod 80 inactive 800 8000 v1.0.0 true
+prod 70 inactive 700 7000 v0.9.0 true
+staging 60 success 600 6000 v1.1.0 true
+EOF2
+run 0
+[ "$(cat "$t/jobs")" = 9000 ] || fail "looked up jobs: $(tr '\n' ' ' < "$t/jobs")"
+
+echo 'all: each repository is checked and reported in order'
+: > "$t/started"
+echo 1 > "$t/runs"
+sh "$here/ngf-deploy" all > "$t/out" 2>&1 || fail "ngf-deploy all failed"
+[ "$(grep -c 'already live on prod' "$t/out")" = 3 ] || fail "not every repository reported"
+grep ' -> prod$' "$t/out" | cut -d' ' -f1 | tr '\n' ' ' | grep -q 'ninja-monitor riot-proxy ninjagoldfinch-lol' \
+    || fail "repositories out of order"
 
 echo 'bad arguments'
 run 1 -b

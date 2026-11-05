@@ -11,12 +11,12 @@
 #   all        every repository that has a deploy.yml
 #   -v         release tag to deploy (default: the latest release)
 #   -e         environment (default: prod)
-#   -w         wait for the run and show how it ended (approve it meanwhile)
+#   -w         wait for the runs and show how they ended (approve them meanwhile)
 #   -f         force: deploy even if that version is already live or already
 #              being deployed there
 #   -b         break glass: deploy to prod without passing staging; the reason
 #              is logged in the run (prod only, one service)
-#   -d         debug: also print every gh command and each deployment checked
+#   -d         debug: also print every gh call and each deployment checked
 #   -l         list each repository's latest release and what is live where
 #
 # Before starting anything it prints what it found: the version and its
@@ -27,8 +27,10 @@
 # prod before, so you are not asked to approve a run that would fail.
 #
 # "Live" comes from GitHub's deployment history: the newest deployment to that
-# environment whose deploy step succeeded. A deploy done on the host itself (ngf-host)
-# is not in that history; use -f if the host was changed by hand.
+# environment whose deploy step succeeded. A deploy done on the host itself
+# (ngf-host) is not in that history; use -f if the host was changed by hand.
+#
+# Repositories are checked at the same time, one GraphQL query each.
 #
 # Needs gh, logged in (gh auth login). Rolling back is deploying an older -v.
 set -eu
@@ -38,15 +40,23 @@ repos="ninja-monitor riot-proxy ninjagoldfinch-lol"
 # How many recent deployments per environment to look through.
 history=15
 
-usage() { sed -n '2,33s/^# \{0,1\}//p' "$0"; }
+usage() { sed -n '2,35s/^# \{0,1\}//p' "$0"; }
 die() { echo "ngf-deploy: $*" >&2; exit 1; }
 # Debug lines go to fd 3, a copy of the terminal's stderr, so they still show
 # from commands whose own errors are sent to /dev/null.
 exec 3>&2
 debug() { [ "$dbg" = no ] || echo "  [debug] $*" >&3; }
-# Runs gh, showing the command first in debug mode.
+# Runs gh, showing the command first in debug mode (long arguments shortened).
 ghx() {
-    debug "gh $*"
+    if [ "$dbg" = yes ]; then
+        line=gh
+        for a in "$@"; do
+            case $a in *"
+"*) a="$(printf '%s' "$a" | head -n 1 | cut -c1-40)..." ;; esac
+            line="$line $a"
+        done
+        debug "$line"
+    fi
     gh "$@"
 }
 
@@ -71,68 +81,99 @@ command -v gh >/dev/null 2>&1 || die "needs the GitHub CLI (gh)"
 gh auth status >/dev/null 2>&1 || die "gh is not logged in; run: gh auth login"
 case $env in prod | staging) ;; *) die "-e takes prod or staging" ;; esac
 
-has_deploy() { ghx api "repos/$owner/$1/contents/.github/workflows/deploy.yml" --silent 2>/dev/null; }
-latest() { ghx release view -R "$owner/$1" --json tagName -q .tagName 2>/dev/null; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 
-# <repo> <env>: one line per deployment to <env>, newest first, as
-# "<state> <version> <run id> <deployed>": the state of its latest deployment
-# status (success, failure, waiting, queued, in_progress, ...), the version from
-# its job name "Deploy <version> to <env>", and whether the job's deploy action
-# step succeeded (the version went live on the host even if a later step, such
-# as the staging smoke test, failed). Every job with an environment, including
-# the staging deploy inside release.yml, is a deployment. Callers stop reading
-# early, so usually only the newest one or two are looked up.
-deploys() {
-    for dep in $(ghx api "repos/$owner/$1/deployments?environment=$2&per_page=$history" \
-        -q '.[].id' 2>/dev/null); do
-        st=$(ghx api "repos/$owner/$1/deployments/$dep/statuses?per_page=1" \
-            -q '.[0] | "\(.state) \(.log_url // .target_url // "")"' 2>/dev/null) || st=
-        state=${st%% *} url=${st#* }
-        run=$(echo "$url" | sed -n 's#.*/runs/\([0-9]*\)/job/[0-9]*.*#\1#p')
-        job=$(echo "$url" | sed -n 's#.*/job/\([0-9]*\).*#\1#p')
-        info=
-        [ -z "$job" ] || info=$(ghx api "repos/$owner/$1/actions/jobs/$job" -q \
-            '"\(try (.name | capture("Deploy (?<v>v[^ ]+) to").v) catch "?") \(any(.steps[]?; (.name | test("ninja-actions/deploy")) and .conclusion == "success"))"' 2>/dev/null) || info=
-        [ -n "$info" ] || info='? false'
-        debug "deployment $dep: ${state:-no status}, run ${run:-?}, job ${job:-?}: $info"
-        echo "${state:-none} ${info%% *} ${run:-?} ${info#* }"
-    done
+# One query for everything ngf-deploy needs to know about a repository:
+# whether it has a deploy.yml, its latest release, the tag's commit and that
+# commit's statuses, and the newest deployments to prod and staging with the
+# state and job of each one's latest deployment status. Every job with an
+# environment is a deployment, including the staging deploy in release.yml.
+# shellcheck disable=SC2016 # GraphQL variables, not shell ones
+query='query($owner: String!, $repo: String!, $tag: String!, $n: Int!) {
+  repository(owner: $owner, name: $repo) {
+    deployYml: object(expression: "HEAD:.github/workflows/deploy.yml") { id }
+    latestRelease { tagName tagCommit { ...c } }
+    tag: ref(qualifiedName: $tag) { target { ...c ... on Tag { target { ...c } } } }
+    prod: deployments(environments: ["prod"], first: $n, orderBy: {field: CREATED_AT, direction: DESC}) { ...d }
+    staging: deployments(environments: ["staging"], first: $n, orderBy: {field: CREATED_AT, direction: DESC}) { ...d }
+  }
+}
+fragment c on Commit { oid status { contexts { context state } } }
+fragment d on DeploymentConnection { nodes { databaseId latestStatus { state logUrl } } }'
+
+# Turns the answer into lines the shell reads: "key=value" facts, then
+# "dep <env> <deployment id> <state> <run id> <job id>" newest first.
+# shellcheck disable=SC2016 # jq variables, not shell ones
+shape='.data.repository as $r
+    | ($r.tag.target | if . == null then null elif .oid then . else .target end) as $tagged
+    | (if $want_tag then $tagged else $r.latestRelease.tagCommit end) as $c
+    | "deploy_yml=\($r.deployYml != null)",
+      "latest=\($r.latestRelease.tagName // "")",
+      "sha=\($c.oid // "")",
+      "statuses=\([$c.status.contexts[]? | "\(.context)=\(.state | ascii_downcase)"] | join(" "))",
+      (["prod", "staging"][] as $e | $r[$e].nodes[]
+        | (.latestStatus.logUrl // "" | capture("/runs/(?<run>[0-9]+)/job/(?<job>[0-9]+)") // {run: "?", job: "?"}) as $u
+        | "dep \($e) \(.databaseId) \(.latestStatus.state // "none" | ascii_downcase) \($u.run) \($u.job)")'
+
+# <repo> <job id>: "<version> <deployed>" from the job "Deploy <version> to <env>";
+# <deployed> is whether its deploy action step succeeded (the version went
+# live on the host even if a later step, such as the staging smoke test, failed).
+job_info() {
+    ghx api "repos/$owner/$1/actions/jobs/$2" -q \
+        '"\(try (.name | capture("Deploy (?<v>v[^ ]+) to").v) catch "?") \(any(.steps[]?; (.name | test("ninja-actions/deploy")) and .conclusion == "success"))"' \
+        2>/dev/null || echo '? false'
 }
 
-# <repo> <env>: "<version> <run id>" of the newest deploy to <env>, or nothing.
-live_on() {
-    deploys "$1" "$2" | while read -r state v run ok; do
+# <repo> <env> <version or empty> <facts file>: appends what is live on <env>
+# ("live_<env>=<version> <run>") and, given a version, a deploy of it that has
+# not finished ("pending=<run>"). Looks up only as many jobs as it needs.
+scan() {
+    live='' pend=''
+    while read -r _ e dep state run job; do
+        [ "$e" = "$2" ] || continue
+        [ "$job" != '?' ] || continue
         case $state in
-            success | inactive) ;;
-            failure | error) [ "$ok" = true ] || continue ;;
+            success | inactive | failure | error)
+                [ -z "$live" ] || continue ;;
+            queued | waiting | pending | in_progress)
+                if [ -z "$3" ] || [ -n "$pend" ]; then continue; fi ;;
             *) continue ;;
         esac
-        [ "$v" != '?' ] || continue
-        echo "$v $run"
-        break
-    done
-}
-
-# <repo> <env> <version>: run id of a deploy of <version> to <env> that has not
-# finished (queued, running, or waiting for approval), or nothing.
-pending() {
-    deploys "$1" "$2" | while read -r state v run _; do
+        info=$(job_info "$1" "$job")
+        v=${info%% *} ok=${info#* }
+        debug "$1 $e deployment $dep: $state, run $run, job $job: $v (deploy step ok: $ok)"
         case $state in
-            queued | waiting | pending | in_progress)
-                if [ "$v" = "$3" ]; then
-                    echo "$run"
-                    break
-                fi
-                ;;
+            success | inactive) [ "$v" = '?' ] || live="$v $run" ;;
+            failure | error) [ "$ok" != true ] || [ "$v" = '?' ] || live="$v $run" ;;
+            *) [ "$v" != "$3" ] || pend=$run ;;
         esac
-    done
+        if [ -n "$live" ] && { [ -z "$3" ] || [ -n "$pend" ]; }; then break; fi
+    done < "$4"
+    echo "live_$2=$live" >> "$4"
+    [ -z "$3" ] || echo "pending=$pend" >> "$4"
 }
 
-# <repo> <tag>: "<context>=<state>" for each commit status on the tag's commit.
-statuses() {
-    ghx api "repos/$owner/$1/commits/$2/status" \
-        -q '[.statuses[] | "\(.context)=\(.state)"] | join(" ")' 2>/dev/null || true
+# <repo> <envs> <check pending: yes|no>: writes $tmp/<repo>.facts.
+preflight() {
+    f=$tmp/$1.facts
+    tag=refs/tags/${version:-none}
+    ghx api graphql -F owner="$owner" -F repo="$1" -F tag="$tag" -F n="$history" \
+        -f query="$query" -q "(${version:+true}${version:-false}) as \$want_tag | $shape" \
+        > "$f" 2>"$tmp/$1.err" || {
+        echo "error=$(head -n 1 "$tmp/$1.err")" >> "$f"
+        return 0
+    }
+    want=''
+    if [ "$3" = yes ]; then
+        want=$version
+        [ -n "$want" ] || want=$(sed -n 's/^latest=//p' "$f")
+    fi
+    for e in $2; do scan "$1" "$e" "$want" "$f"; done
 }
+
+# <facts file> <key>: that fact's value.
+fact() { sed -n "s/^$2=//p" "$1" | head -n 1; }
 state_of() { # <context> <statuses>
     for s in $2; do
         case $s in "$1="*) echo "${s#*=}"; return ;; esac
@@ -141,13 +182,17 @@ state_of() { # <context> <statuses>
 }
 
 if [ "$list" = yes ]; then
+    for r in $repos; do preflight "$r" "prod staging" no & done
+    wait
     printf '%-20s %-10s %-10s %-10s %s\n' repository latest prod staging deploy.yml
     for r in $repos; do
-        if has_deploy "$r"; then d=yes; else d=no; fi
-        p=$(live_on "$r" prod) s=$(live_on "$r" staging)
+        f=$tmp/$r.facts
+        err=$(fact "$f" error)
+        if [ -n "$err" ]; then echo "$r: $err"; continue; fi
+        if [ "$(fact "$f" deploy_yml)" = true ]; then d=yes; else d=no; fi
+        l=$(fact "$f" latest) p=$(fact "$f" live_prod) s=$(fact "$f" live_staging)
         p=${p%% *} s=${s%% *}
-        printf '%-20s %-10s %-10s %-10s %s\n' "$r" "$(latest "$r" || echo none)" \
-            "${p:--}" "${s:--}" "$d"
+        printf '%-20s %-10s %-10s %-10s %s\n' "$r" "${l:-none}" "${p:--}" "${s:--}" "$d"
     done
     exit 0
 fi
@@ -160,27 +205,31 @@ if [ -n "$reason" ]; then
     [ "$env" = prod ] || die "-b is for prod; staging has no gate"
     [ "$count" -eq 1 ] || die "-b applies to one service at a time"
 fi
-
-failed=0
 for svc in $services; do
     case " $repos " in *" $svc "*) ;; *) die "unknown service $svc (one of: $repos)" ;; esac
-    if ! has_deploy "$svc"; then
-        if [ "$all" = yes ]; then echo "$svc: no deploy.yml yet, skipped"; continue; fi
-        die "$svc has no deploy.yml yet"
-    fi
-    if [ -n "$version" ]; then
-        v=$version from='-v'
-    else
-        v=$(latest "$svc") || true
-        from='latest release'
-    fi
-    [ -n "$v" ] || die "$svc has no releases"
+done
 
-    sha=$(ghx api "repos/$owner/$svc/commits/$v" -q .sha 2>/dev/null) || true
-    [ -n "$sha" ] || die "$svc has no tag $v"
-    st=$(statuses "$svc" "$v")
+# 1. Check every repository at once.
+for svc in $services; do preflight "$svc" "$env" yes & done
+wait
+
+# 2. Decide, in order, and start what should start.
+failed=0 started=''
+for svc in $services; do
+    f=$tmp/$svc.facts
+    err=$(fact "$f" error)
+    [ -z "$err" ] || { echo "$svc: GitHub query failed: $err" >&2; failed=1; continue; }
+    if [ "$(fact "$f" deploy_yml)" != true ]; then
+        if [ "$all" = yes ]; then echo "$svc: no deploy.yml yet, skipped"; continue; fi
+        echo "$svc has no deploy.yml yet" >&2; failed=1; continue
+    fi
+    if [ -n "$version" ]; then v=$version from='-v'; else v=$(fact "$f" latest) from='latest release'; fi
+    [ -n "$v" ] || { echo "$svc has no releases" >&2; failed=1; continue; }
+    sha=$(fact "$f" sha)
+    [ -n "$sha" ] || { echo "$svc has no tag $v" >&2; failed=1; continue; }
+    st=$(fact "$f" statuses)
     smoke=$(state_of staging/smoke "$st") prodok=$(state_of prod/deployed "$st")
-    live=$(live_on "$svc" "$env")
+    live=$(fact "$f" "live_$env") run=$(fact "$f" pending)
     live_v=${live%% *} live_run=${live#* }
 
     echo "$svc $v -> $env"
@@ -197,7 +246,6 @@ for svc in $services; do
         echo "  already live on $env; nothing to do (-f deploys it again)"
         continue
     fi
-    run=$(pending "$svc" "$env" "$v")
     if [ "$force" = no ] && [ -n "$run" ]; then
         echo "  a deploy of $v to $env is already under way: https://github.com/$owner/$svc/actions/runs/$run"
         echo "  nothing started (-f starts another)"
@@ -217,29 +265,61 @@ for svc in $services; do
     else
         ghx workflow run deploy.yml -R "$owner/$svc" -f env="$env" -f version="$v" >/dev/null
     fi
-    # The new run takes a moment to appear.
-    id=$before
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        sleep 2
-        id=$(ghx run list -R "$owner/$svc" --workflow deploy.yml --limit 1 --json databaseId -q '.[0].databaseId // 0')
-        [ "$id" != "$before" ] && break
-    done
-    url=https://github.com/$owner/$svc/actions/runs/$id
-    [ "$id" != "$before" ] || url="https://github.com/$owner/$svc/actions/workflows/deploy.yml"
-    echo "  started   $url"
-    [ "$env" = prod ] && echo "  waiting for your approval: open the link, Review deployments, Approve"
+    echo "$svc $v $before" >> "$tmp/started"
+    started="$started $svc"
+done
 
-    if [ "$watch" = yes ] && [ "$id" != "$before" ]; then
-        if ghx run watch "$id" -R "$owner/$svc" --exit-status >/dev/null 2>&1; then
-            echo "  $svc $v is live on $env"
+# 3. Find the new runs (they take a moment to appear), all at once.
+find_run() { # <svc> <run id before>: writes $tmp/<svc>.run
+    id=$2
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        sleep 1
+        id=$(ghx run list -R "$owner/$1" --workflow deploy.yml --limit 1 --json databaseId -q '.[0].databaseId // 0')
+        [ "$id" = "$2" ] || break
+    done
+    [ "$id" = "$2" ] || echo "$id" > "$tmp/$1.run"
+}
+if [ -s "$tmp/started" ]; then
+    while read -r svc _ before; do find_run "$svc" "$before" & done < "$tmp/started"
+    wait
+    while read -r svc v _; do
+        if [ -s "$tmp/$svc.run" ]; then
+            url=https://github.com/$owner/$svc/actions/runs/$(cat "$tmp/$svc.run")
         else
-            echo "  $svc $v did not deploy; see $url" >&2
-            echo "  last lines of the failed steps:" >&2
-            ghx run view "$id" -R "$owner/$svc" --log-failed 2>/dev/null | tail -n 40 | sed 's/^/    /' >&2 || true
-            failed=1
+            url=https://github.com/$owner/$svc/actions/workflows/deploy.yml
         fi
-    elif [ "$watch" = no ]; then
+        echo "$svc $v -> $env started: $url"
+    done < "$tmp/started"
+    [ "$env" = prod ] && echo "  waiting for your approval: open each link, Review deployments, Approve"
+fi
+
+# 4. With -w, watch them all at once; each result prints when its run ends.
+watch_run() { # <svc> <version>
+    id=$(cat "$tmp/$1.run")
+    url=https://github.com/$owner/$1/actions/runs/$id
+    if ghx run watch "$id" -R "$owner/$1" --exit-status >/dev/null 2>&1; then
+        echo "  $1 $2 is live on $env"
+    else
+        {
+            echo "  $1 $2 did not deploy; see $url"
+            echo "  last lines of the failed steps:"
+            ghx run view "$id" -R "$owner/$1" --log-failed 2>/dev/null | tail -n 40 | sed 's/^/    /' || true
+        } > "$tmp/$1.failed"
+        cat "$tmp/$1.failed" >&2
+        return 1
+    fi
+}
+if [ -s "$tmp/started" ]; then
+    if [ "$watch" = yes ]; then
+        pids=''
+        while read -r svc v _; do
+            [ -s "$tmp/$svc.run" ] || continue
+            watch_run "$svc" "$v" &
+            pids="$pids $!"
+        done < "$tmp/started"
+        for p in $pids; do wait "$p" || failed=1; done
+    else
         echo "  not waiting; -w waits and shows how it ended"
     fi
-done
+fi
 exit "$failed"
